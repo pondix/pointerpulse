@@ -1,7 +1,7 @@
 FROM debian:12 AS build
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    build-essential cmake libssl-dev ca-certificates mysql-client && \
+    build-essential cmake libssl-dev ca-certificates default-mysql-client && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . /src
@@ -11,7 +11,7 @@ RUN cmake -S . -B /build -DENABLE_TESTING=OFF \
 FROM debian:12-slim
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    libssl3 ca-certificates mysql-client && \
+    libssl3 ca-certificates default-mysql-client && \
     rm -rf /var/lib/apt/lists/*
 ENV MALLOC_ARENA_MAX=2
 COPY --from=build /build/replicapulse /usr/local/bin/replicapulse
