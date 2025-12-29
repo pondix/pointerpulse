@@ -23,8 +23,8 @@ services:
     environment:
       MYSQL_HOST: mysql
       MYSQL_PORT: 3306
-      USER: root
-      PASSWORD: example
+      MYSQL_USER: root
+      MYSQL_PASSWORD: example
       SERVER_ID: 4242
       START_BINLOG: mysql-bin.000001
       START_POS: 4
@@ -46,10 +46,10 @@ services:
       - ./docker/demo/workload_runner.sh:/workload/workload_runner.sh:ro
     entrypoint: ["bash", "/workload/workload_runner.sh"]
     environment:
-      HOST: mysql
-      PORT: 3306
-      USER: root
-      PASSWORD: example
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: root
+      MYSQL_PASSWORD: example
 
 volumes:
   mysql-data:
