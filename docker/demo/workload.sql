@@ -26,10 +26,41 @@ ON DUPLICATE KEY UPDATE qty = VALUES(qty);
 UPDATE widgets SET descr = CONCAT(descr, ' updated') WHERE name = 'alpha';
 UPDATE parts SET qty = qty + 1 WHERE code = 'AA-0002';
 DELETE FROM parts WHERE code = 'BB-0001';
-ALTER TABLE widgets ADD COLUMN IF NOT EXISTS notes JSON;
+-- add notes column only if it doesn't already exist (compatibility with older MySQL clients)
+SET @widget_notes_exists := (
+    SELECT COUNT(*)
+    FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'widgets'
+      AND COLUMN_NAME = 'notes'
+);
+SET @widget_notes_ddl := IF(@widget_notes_exists = 0,
+    'ALTER TABLE widgets ADD COLUMN notes JSON',
+    'DO 0'
+);
+PREPARE widget_notes_stmt FROM @widget_notes_ddl;
+EXECUTE widget_notes_stmt;
+DEALLOCATE PREPARE widget_notes_stmt;
+
 UPDATE widgets SET notes = JSON_OBJECT('status','ok') WHERE name = 'beta';
 TRUNCATE TABLE parts;
-DROP INDEX IF EXISTS uq_code ON parts;
+
+-- drop index only if it exists (compatibility with older MySQL clients)
+SET @parts_uq_exists := (
+    SELECT COUNT(*)
+    FROM INFORMATION_SCHEMA.STATISTICS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'parts'
+      AND INDEX_NAME = 'uq_code'
+);
+SET @parts_uq_ddl := IF(@parts_uq_exists > 0,
+    'DROP INDEX uq_code ON parts',
+    'DO 0'
+);
+PREPARE parts_uq_stmt FROM @parts_uq_ddl;
+EXECUTE parts_uq_stmt;
+DEALLOCATE PREPARE parts_uq_stmt;
+
 ALTER TABLE parts ADD UNIQUE KEY uq_code (code);
 
 -- idempotent cleanup/rotation
