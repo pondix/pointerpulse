@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HOST=${HOST:-${MYSQL_HOST:-mysql}}
-PORT=${PORT:-${MYSQL_PORT:-3306}}
-USER=${USER:-root}
-PASSWORD=${PASSWORD:-example}
+MYSQL_HOST=${MYSQL_HOST:-${HOST:-mysql}}
+MYSQL_PORT=${MYSQL_PORT:-${PORT:-3306}}
+MYSQL_USER=${MYSQL_USER:-${USER:-root}}
+MYSQL_PASSWORD=${MYSQL_PASSWORD:-${PASSWORD:-example}}
 SERVER_ID=${SERVER_ID:-7777}
 START_BINLOG=${START_BINLOG:-mysql-bin.000001}
 START_POS=${START_POS:-4}
@@ -18,10 +18,10 @@ mkdir -p "$(dirname "${CHECKPOINT_FILE}")"
 >"${CHECKPOINT_FILE}"
 
 for i in {1..30}; do
-  if mysqladmin ping -h"${HOST}" -P"${PORT}" -u"${USER}" -p"${PASSWORD}" --silent; then
+  if mysqladmin ping -h"${MYSQL_HOST}" -P"${MYSQL_PORT}" -u"${MYSQL_USER}" -p"${MYSQL_PASSWORD}" --silent; then
     break
   fi
-  echo "waiting for mysql at ${HOST}:${PORT}..." >&2
+  echo "waiting for mysql at ${MYSQL_HOST}:${MYSQL_PORT}..." >&2
   sleep 2
   if [[ "$i" == "30" ]]; then
     echo "mysql not reachable" >&2
@@ -29,6 +29,6 @@ for i in {1..30}; do
   fi
 done
 
-exec /usr/local/bin/replicapulse --host "${HOST}" --port "${PORT}" --user "${USER}" --password "${PASSWORD}" \
+exec /usr/local/bin/replicapulse --host "${MYSQL_HOST}" --port "${MYSQL_PORT}" --user "${MYSQL_USER}" --password "${MYSQL_PASSWORD}" \
   --server-id "${SERVER_ID}" --start-binlog "${START_BINLOG}" --start-pos "${START_POS}" \
   --checkpoint-file "${CHECKPOINT_FILE}" --output "${OUTPUT_PATH}" ${EXTRA_ARGS}
