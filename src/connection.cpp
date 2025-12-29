@@ -62,6 +62,28 @@ std::vector<uint8_t> scramble_native_password(const std::string &password, const
     return token;
 }
 
+std::vector<uint8_t> scramble_caching_sha2_password(const std::string &password, const std::vector<uint8_t> &salt) {
+    std::vector<uint8_t> stage1(SHA256_DIGEST_LENGTH);
+    SHA256(reinterpret_cast<const unsigned char *>(password.data()), password.size(), stage1.data());
+
+    std::vector<uint8_t> stage2(SHA256_DIGEST_LENGTH);
+    SHA256(stage1.data(), stage1.size(), stage2.data());
+
+    std::vector<uint8_t> combined;
+    combined.reserve(salt.size() + stage2.size());
+    combined.insert(combined.end(), salt.begin(), salt.end());
+    combined.insert(combined.end(), stage2.begin(), stage2.end());
+
+    std::vector<uint8_t> stage3(SHA256_DIGEST_LENGTH);
+    SHA256(combined.data(), combined.size(), stage3.data());
+
+    std::vector<uint8_t> token(stage1.size());
+    for (size_t i = 0; i < token.size(); ++i) {
+        token[i] = stage1[i] ^ stage3[i];
+    }
+    return token;
+}
+
 uint64_t read_lenenc_int(const uint8_t *&p, const uint8_t *end) {
     if (p >= end) return 0;
     uint8_t first = *p++;
@@ -334,7 +356,12 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
     response.insert(response.end(), user.begin(), user.end());
     response.push_back(0);
 
-    auto token = scramble_native_password(password, scramble_buffer_);
+    std::vector<uint8_t> token;
+    if (auth_plugin_name == "caching_sha2_password") {
+        token = scramble_caching_sha2_password(password, scramble_buffer_);
+    } else {
+        token = scramble_native_password(password, scramble_buffer_);
+    }
     if (capability & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) {
         uint8_t len = static_cast<uint8_t>(token.size());
         response.push_back(len);
