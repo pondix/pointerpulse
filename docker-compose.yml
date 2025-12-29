@@ -1,0 +1,55 @@
+version: "3.9"
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: example
+    command: ["mysqld", "--server-id=1", "--log-bin=mysql-bin", "--binlog-format=ROW", "--gtid-mode=ON", "--enforce-gtid-consistency=ON", "--binlog-checksum=CRC32"]
+    ports:
+      - "3307:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-pexample"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - mysql-data:/var/lib/mysql
+
+  replicapulse:
+    build: .
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      USER: root
+      PASSWORD: example
+      SERVER_ID: 4242
+      START_BINLOG: mysql-bin.000001
+      START_POS: 4
+      OUTPUT_PATH: /var/lib/replicapulse/output.sql
+      CHECKPOINT_FILE: /var/lib/replicapulse/checkpoint
+      EXTRA_ARGS: "--include-gtid --include-binlog-coords"
+    volumes:
+      - ./docker/demo/output:/var/lib/replicapulse
+
+  workload:
+    image: mysql:8.0
+    depends_on:
+      mysql:
+        condition: service_healthy
+      replicapulse:
+        condition: service_started
+    volumes:
+      - ./docker/demo/workload.sql:/workload/workload.sql:ro
+      - ./docker/demo/workload_runner.sh:/workload/workload_runner.sh:ro
+    entrypoint: ["bash", "/workload/workload_runner.sh"]
+    environment:
+      HOST: mysql
+      PORT: 3306
+      USER: root
+      PASSWORD: example
+
+volumes:
+  mysql-data:
