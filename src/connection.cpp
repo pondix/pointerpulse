@@ -7,10 +7,13 @@
 #include <sys/time.h>
 #include <unistd.h>
 #include <openssl/sha.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <string>
 
 namespace replicapulse {
 
@@ -24,6 +27,7 @@ constexpr uint32_t CLIENT_MULTI_RESULTS = 1u << 17;
 constexpr uint32_t CLIENT_PLUGIN_AUTH = 1u << 19;
 constexpr uint32_t CLIENT_DEPRECATE_EOF = 1u << 24;
 constexpr uint32_t CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA = 1u << 21;
+constexpr uint32_t CLIENT_SSL = 1u << 11;
 constexpr uint8_t COM_QUERY = 0x03;
 constexpr uint8_t COM_BINLOG_DUMP = 0x12;
 constexpr uint8_t COM_BINLOG_DUMP_GTID = 0x1e;
@@ -99,6 +103,16 @@ bool is_eof_packet(const Packet &packet) {
 MySQLConnection::~MySQLConnection() { close(); }
 
 void MySQLConnection::close() {
+    if (ssl_handle_) {
+        SSL_shutdown(ssl_handle_);
+        SSL_free(ssl_handle_);
+        ssl_handle_ = nullptr;
+    }
+    if (ssl_ctx_) {
+        SSL_CTX_free(ssl_ctx_);
+        ssl_ctx_ = nullptr;
+    }
+    ssl_active_ = false;
     if (sock_fd_ >= 0) {
         ::close(sock_fd_);
         sock_fd_ = -1;
@@ -108,27 +122,11 @@ void MySQLConnection::close() {
 bool MySQLConnection::connect(const std::string &host, uint16_t port, const std::string &user,
                                const std::string &password, uint32_t server_id,
                                const std::string &binlog_file, uint32_t position) {
-    sock_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (sock_fd_ < 0) return false;
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
-        std::cerr << "Invalid host address" << std::endl;
-        close();
-        return false;
-    }
-
-    if (::connect(sock_fd_, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
-        std::perror("connect");
-        close();
-        return false;
-    }
+    if (!open_socket(host, port)) return false;
 
     set_timeout_ms(timeout_ms_);
 
-    if (!handshake(user, password)) {
+    if (!handshake(host, user, password)) {
         std::cerr << "MySQL handshake failed" << std::endl;
         close();
         return false;
@@ -146,27 +144,11 @@ bool MySQLConnection::connect_gtid(const std::string &host, uint16_t port, const
                                    const std::string &password, uint32_t server_id,
                                    const std::string &binlog_file, uint64_t position,
                                    const std::string &gtid_set) {
-    sock_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (sock_fd_ < 0) return false;
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
-        std::cerr << "Invalid host address" << std::endl;
-        close();
-        return false;
-    }
-
-    if (::connect(sock_fd_, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
-        std::perror("connect");
-        close();
-        return false;
-    }
+    if (!open_socket(host, port)) return false;
 
     set_timeout_ms(timeout_ms_);
 
-    if (!handshake(user, password)) {
+    if (!handshake(host, user, password)) {
         std::cerr << "MySQL handshake failed" << std::endl;
         close();
         return false;
@@ -182,26 +164,48 @@ bool MySQLConnection::connect_gtid(const std::string &host, uint16_t port, const
 
 bool MySQLConnection::connect_sql(const std::string &host, uint16_t port, const std::string &user,
                                   const std::string &password) {
-    sock_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (sock_fd_ < 0) return false;
+    if (!open_socket(host, port)) return false;
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
-        close();
-        return false;
-    }
-    if (::connect(sock_fd_, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
-        close();
-        return false;
-    }
     set_timeout_ms(timeout_ms_);
-    if (!handshake(user, password)) {
+    if (!handshake(host, user, password)) {
         close();
         return false;
     }
     return true;
+}
+
+bool MySQLConnection::open_socket(const std::string &host, uint16_t port) {
+    close();
+
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    addrinfo *result = nullptr;
+    const std::string port_str = std::to_string(port);
+    int rc = ::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &result);
+    if (rc != 0) {
+        std::cerr << "Invalid host address: " << ::gai_strerror(rc) << std::endl;
+        return false;
+    }
+
+    for (addrinfo *rp = result; rp != nullptr; rp = rp->ai_next) {
+        sock_fd_ = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sock_fd_ < 0) continue;
+
+        if (::connect(sock_fd_, rp->ai_addr, rp->ai_addrlen) == 0) {
+            ::freeaddrinfo(result);
+            return true;
+        }
+
+        ::close(sock_fd_);
+        sock_fd_ = -1;
+    }
+
+    std::perror("connect");
+    ::freeaddrinfo(result);
+    return false;
 }
 
 bool MySQLConnection::set_timeout_ms(uint32_t timeout_ms) {
@@ -214,7 +218,42 @@ bool MySQLConnection::set_timeout_ms(uint32_t timeout_ms) {
     return true;
 }
 
-bool MySQLConnection::handshake(const std::string &user, const std::string &password) {
+bool MySQLConnection::ensure_tls(const std::string &host, uint32_t capability_flags) {
+    if (ssl_active_) return true;
+
+    ssl_ctx_ = SSL_CTX_new(TLS_client_method());
+    if (!ssl_ctx_) return false;
+
+    ssl_handle_ = SSL_new(ssl_ctx_);
+    if (!ssl_handle_) return false;
+
+    SSL_set_fd(ssl_handle_, sock_fd_);
+    SSL_set_tlsext_host_name(ssl_handle_, host.c_str());
+
+    // SSL Request packet mirrors the initial handshake response header fields.
+    std::vector<uint8_t> ssl_req(4, 0);
+    ssl_req[0] = capability_flags & 0xff;
+    ssl_req[1] = (capability_flags >> 8) & 0xff;
+    ssl_req[2] = (capability_flags >> 16) & 0xff;
+    ssl_req[3] = (capability_flags >> 24) & 0xff;
+    uint32_t max_packet_size = 1024 * 1024 * 16;
+    for (int i = 0; i < 4; ++i) ssl_req.push_back((max_packet_size >> (8 * i)) & 0xff);
+    ssl_req.push_back(33);
+    ssl_req.insert(ssl_req.end(), 23, 0);
+
+    if (!write_packet(ssl_req)) return false;
+
+    if (SSL_connect(ssl_handle_) != 1) {
+        ERR_print_errors_fp(stderr);
+        return false;
+    }
+
+    ssl_active_ = true;
+    return true;
+}
+
+bool MySQLConnection::handshake(const std::string &host, const std::string &user, const std::string &password) {
+    sequence_ = 0;
     Packet packet;
     if (!read_packet(packet)) return false;
     const uint8_t *ptr = packet.payload.data();
@@ -271,8 +310,13 @@ bool MySQLConnection::handshake(const std::string &user, const std::string &pass
     uint32_t server_capability = capability_flags1 | (static_cast<uint32_t>(capability_flags2) << 16);
     if (server_capability & CLIENT_PLUGIN_AUTH) desired |= CLIENT_PLUGIN_AUTH;
     if (server_capability & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) desired |= CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA;
+    if (use_tls_ && (server_capability & CLIENT_SSL)) desired |= CLIENT_SSL;
 
     uint32_t capability = desired & server_capability;
+
+    if ((capability & CLIENT_SSL) && use_tls_) {
+        if (!ensure_tls(host, capability)) return false;
+    }
 
     std::vector<uint8_t> response;
     response.reserve(256);
@@ -423,19 +467,35 @@ bool MySQLConnection::read_binlog_packet(BinlogPacket &packet) {
     return true;
 }
 
+bool MySQLConnection::recv_all(uint8_t *buf, size_t len) {
+    size_t received = 0;
+    while (received < len) {
+        int n = ssl_active_ ? SSL_read(ssl_handle_, buf + received, static_cast<int>(len - received))
+                            : ::recv(sock_fd_, buf + received, len - received, 0);
+        if (n <= 0) return false;
+        received += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+bool MySQLConnection::send_all(const uint8_t *buf, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        int n = ssl_active_ ? SSL_write(ssl_handle_, buf + sent, static_cast<int>(len - sent))
+                            : ::send(sock_fd_, buf + sent, len - sent, 0);
+        if (n <= 0) return false;
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
 bool MySQLConnection::read_packet(Packet &packet) {
     uint8_t header[4];
-    ssize_t r = ::recv(sock_fd_, header, 4, MSG_WAITALL);
-    if (r != 4) return false;
+    if (!recv_all(header, 4)) return false;
     uint32_t length = header[0] | (header[1] << 8) | (header[2] << 16);
     packet.sequence = header[3];
     packet.payload.resize(length);
-    size_t received = 0;
-    while (received < length) {
-        ssize_t n = ::recv(sock_fd_, packet.payload.data() + received, length - received, 0);
-        if (n <= 0) return false;
-        received += n;
-    }
+    if (!recv_all(packet.payload.data(), length)) return false;
     return true;
 }
 
@@ -446,14 +506,8 @@ bool MySQLConnection::write_packet(const std::vector<uint8_t> &payload) {
     header[1] = (length >> 8) & 0xff;
     header[2] = (length >> 16) & 0xff;
     header[3] = sequence_++;
-    if (::send(sock_fd_, header, 4, 0) != 4) return false;
-    size_t sent = 0;
-    while (sent < payload.size()) {
-        ssize_t n = ::send(sock_fd_, payload.data() + sent, payload.size() - sent, 0);
-        if (n <= 0) return false;
-        sent += n;
-    }
-    return true;
+    if (!send_all(header, 4)) return false;
+    return send_all(payload.data(), payload.size());
 }
 
 } // namespace replicapulse

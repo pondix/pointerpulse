@@ -49,6 +49,7 @@ ReplicaPulseConfig parse_args(int argc, char **argv) {
         else if (arg == "--reconnect-delay-ms") cfg.reconnect_delay_ms = static_cast<uint32_t>(std::stoul(next()));
         else if (arg == "--reconnect-delay-max-ms") cfg.reconnect_delay_max_ms = static_cast<uint32_t>(std::stoul(next()));
         else if (arg == "--io-timeout-ms") cfg.io_timeout_ms = static_cast<uint32_t>(std::stoul(next()));
+        else if (arg == "--ssl") cfg.use_tls = true;
         else if (arg == "--decode-queue-size") cfg.decode_queue_size = static_cast<size_t>(std::stoul(next()));
         else if (arg == "--work-queue-size") cfg.work_queue_size = static_cast<size_t>(std::stoul(next()));
         else if (arg == "--include-gtid") cfg.include_gtid = true;

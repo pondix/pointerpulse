@@ -84,12 +84,14 @@ int run_replicapulse(const ReplicaPulseConfig &config_in, const SqlSink &sink, s
     }
 
     ctx.metadata_conn.set_default_timeout_ms(config.io_timeout_ms);
+    ctx.metadata_conn.set_use_tls(config.use_tls);
     if (!ctx.metadata_conn.connect_sql(config.host, config.port, config.user, config.password)) {
         std::cerr << "warning: metadata connection failed; proceeding without column names" << std::endl;
     }
 
     MySQLConnection stream_conn;
     stream_conn.set_default_timeout_ms(config.io_timeout_ms);
+    stream_conn.set_use_tls(config.use_tls);
     auto connect_stream = [&]() {
         std::lock_guard<std::mutex> lk(ctx.pos_mutex);
         std::string resume_gtids = ctx.gtid_tracker.executed_string();
