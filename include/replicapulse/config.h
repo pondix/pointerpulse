@@ -35,6 +35,8 @@ struct ReplicaPulseConfig {
     uint32_t reconnect_delay_max_ms{8000};
     uint32_t io_timeout_ms{1000};
 
+    bool use_tls{false};
+
     bool include_gtid{true};
     bool include_binlog_coords{true};
 
