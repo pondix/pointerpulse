@@ -4,7 +4,7 @@ services:
     image: mysql:8.0
     environment:
       MYSQL_ROOT_PASSWORD: example
-    command: ["mysqld", "--server-id=1", "--log-bin=mysql-bin", "--binlog-format=ROW", "--gtid-mode=ON", "--enforce-gtid-consistency=ON", "--binlog-checksum=CRC32"]
+    command: ["mysqld", "--server-id=1", "--log-bin=mysql-bin", "--binlog-format=ROW", "--gtid-mode=ON", "--enforce-gtid-consistency=ON", "--binlog-checksum=CRC32", "--default-authentication-plugin=mysql_native_password"]
     ports:
       - "3307:3306"
     healthcheck:
