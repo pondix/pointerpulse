@@ -20,27 +20,45 @@ std::string strip_backticks(const std::string &ident) {
     return out;
 }
 
-std::optional<std::pair<std::string, std::string>> detect_ddl_target(const std::string &query, const std::string &default_schema) {
-    std::string lower;
-    lower.reserve(query.size());
-    for (unsigned char c : query) lower.push_back(static_cast<char>(std::tolower(c)));
+bool case_insensitive_match(const std::string &text, size_t pos, const char *pattern) {
+    size_t i = 0;
+    while (pattern[i] != '\0') {
+        if (pos + i >= text.size()) return false;
+        if (std::tolower(static_cast<unsigned char>(text[pos + i])) !=
+            std::tolower(static_cast<unsigned char>(pattern[i]))) {
+            return false;
+        }
+        ++i;
+    }
+    return true;
+}
 
-    const std::vector<std::string> prefixes = {"create table",   "alter table",   "drop table",  "truncate table",
-                                               "rename table",   "create index",  "drop index",  "create unique index",
-                                               "create view",    "alter view",    "drop view",   "create temporary table",
-                                               "drop temporary table"};
+std::optional<std::pair<std::string, std::string>> detect_ddl_target(const std::string &query, const std::string &default_schema) {
+    const char *prefixes[] = {"create table", "alter table", "drop table", "truncate table",
+                             "rename table", "create index", "drop index", "create unique index",
+                             "create view", "alter view", "drop view", "create temporary table",
+                             "drop temporary table"};
+
     size_t found = std::string::npos;
-    std::string matched;
-    for (const auto &p : prefixes) {
-        auto pos = lower.find(p);
-        if (pos != std::string::npos && (found == std::string::npos || pos < found)) {
-            found = pos;
-            matched = p;
+    const char *matched = nullptr;
+
+    // Only scan first 200 chars for DDL keywords (optimization)
+    size_t scan_limit = std::min(query.size(), size_t(200));
+    for (size_t pos = 0; pos < scan_limit; ++pos) {
+        if (!std::isspace(static_cast<unsigned char>(query[pos])) || pos == 0) {
+            for (const auto *p : prefixes) {
+                if (case_insensitive_match(query, pos, p)) {
+                    found = pos;
+                    matched = p;
+                    goto done_scanning;
+                }
+            }
         }
     }
+done_scanning:
     if (found == std::string::npos) return std::nullopt;
 
-    size_t start = found + matched.size();
+    size_t start = found + std::strlen(matched);
     while (start < query.size() && std::isspace(static_cast<unsigned char>(query[start]))) ++start;
     if (start >= query.size()) return std::nullopt;
 

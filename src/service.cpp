@@ -29,11 +29,23 @@ struct AppContext {
     GtidTracker gtid_tracker;
 };
 
+static std::string escape_sql_string(const std::string &input) {
+    std::string escaped;
+    escaped.reserve(input.size() + 2);
+    for (unsigned char c : input) {
+        if (c == '\'') escaped += "''";
+        else if (c == '\\') escaped += "\\\\";
+        else escaped.push_back(static_cast<char>(c));
+    }
+    return escaped;
+}
+
 static bool fetch_table_metadata(AppContext &ctx, uint64_t table_id, const TableMapEvent &map) {
     if (!ctx.metadata_conn.is_connected()) return false;
     std::vector<std::vector<std::string>> rows;
     std::string query = "SELECT COLUMN_NAME, COLUMN_KEY FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='" +
-                        map.schema + "' AND TABLE_NAME='" + map.table + "' ORDER BY ORDINAL_POSITION";
+                        escape_sql_string(map.schema) + "' AND TABLE_NAME='" + escape_sql_string(map.table) +
+                        "' ORDER BY ORDINAL_POSITION";
     if (!ctx.metadata_conn.send_query(query, rows)) return false;
     TableMetadata meta;
     meta.schema = map.schema;
