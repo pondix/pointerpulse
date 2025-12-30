@@ -312,12 +312,15 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
             if (server_cap & CLIENT_PLUGIN_AUTH) {
                 size_t len = std::max<size_t>(13, auth_plugin_data_len > 8 ? auth_plugin_data_len - 8 : 0);
                 if (ptr + len > end) return false;
-                scramble.insert(scramble.end(), ptr, ptr + len);
+                // Insert all but the last byte (which is a null terminator)
+                size_t scramble_len = len > 0 ? len - 1 : 0;
+                scramble.insert(scramble.end(), ptr, ptr + scramble_len);
                 ptr += len;
             } else {
-                size_t len = 12; // second part fallback
+                size_t len = 13; // second part fallback (12 bytes + 1 null terminator)
                 if (ptr + len > end) return false;
-                scramble.insert(scramble.end(), ptr, ptr + len);
+                // Insert only 12 bytes, excluding the null terminator
+                scramble.insert(scramble.end(), ptr, ptr + 12);
                 ptr += len;
             }
             if (server_cap & CLIENT_PLUGIN_AUTH && ptr < end) {
