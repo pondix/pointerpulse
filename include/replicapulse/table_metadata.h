@@ -6,7 +6,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include <mutex>
+#include <shared_mutex>
 
 namespace replicapulse {
 
@@ -27,7 +27,7 @@ public:
     bool get(uint64_t table_id, TableMetadata &meta) const;
     void clear_schema(const std::string &schema, const std::string &table);
 private:
-    mutable std::mutex mutex_;
+    mutable std::shared_mutex mutex_;
     std::unordered_map<uint64_t, TableMetadata> by_id_;
 };
 

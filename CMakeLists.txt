@@ -5,6 +5,19 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# Enable LTO for Release builds by default
+if(NOT DEFINED CMAKE_INTERPROCEDURAL_OPTIMIZATION)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO ON)
+endif()
+
+# Optimize for the build machine architecture in Release mode
+if(CMAKE_BUILD_TYPE MATCHES "Release" OR CMAKE_BUILD_TYPE MATCHES "RelWithDebInfo")
+    if(NOT DEFINED DISABLE_NATIVE_ARCH)
+        add_compile_options(-march=native)
+    endif()
+endif()
+
 option(ENABLE_SANITIZERS "Enable address/UB sanitizers for leak detection" OFF)
 if (ENABLE_SANITIZERS)
     add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
@@ -78,3 +91,7 @@ add_test(NAME gtid_tracker_commit_test COMMAND gtid_tracker_commit_test)
 add_executable(output_sink_test tests/output_sink_test.cpp)
 target_link_libraries(output_sink_test PRIVATE replicapulse)
 add_test(NAME output_sink_test COMMAND output_sink_test)
+
+add_executable(optimization_test tests/optimization_test.cpp)
+target_link_libraries(optimization_test PRIVATE replicapulse)
+add_test(NAME optimization_test COMMAND optimization_test)

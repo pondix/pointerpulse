@@ -5,13 +5,20 @@
 
 namespace replicapulse {
 namespace {
+
+// Thread-local buffer for building SQL strings to reduce allocations
+thread_local std::string g_sql_buffer;
+
 std::string hex_encode(const std::vector<uint8_t> &data) {
-    std::ostringstream oss;
-    oss << "0x";
+    static const char hex_chars[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(data.size() * 2 + 2);
+    result += "0x";
     for (auto b : data) {
-        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(b);
+        result.push_back(hex_chars[(b >> 4) & 0x0F]);
+        result.push_back(hex_chars[b & 0x0F]);
     }
-    return oss.str();
+    return result;
 }
 }
 
@@ -68,9 +75,13 @@ std::string SqlFormatter::escape_value(const CellValue &value, const ColumnType 
 
 std::string SqlFormatter::format_event_prefix(const BinlogEventHeader &header) const {
     if (!include_coords_ || header.binlog_file.empty()) return "";
-    std::ostringstream oss;
-    oss << "/* binlog " << header.binlog_file << ":" << header.start_position << " */\n";
-    return oss.str();
+    g_sql_buffer.clear();
+    g_sql_buffer += "/* binlog ";
+    g_sql_buffer += header.binlog_file;
+    g_sql_buffer += ":";
+    g_sql_buffer += std::to_string(header.start_position);
+    g_sql_buffer += " */\n";
+    return g_sql_buffer;
 }
 
 std::string SqlFormatter::format_query(const QueryEvent &event, const BinlogEventHeader &header) const {
@@ -90,39 +101,48 @@ std::string SqlFormatter::format_begin(const BinlogEventHeader &) const { return
 std::string SqlFormatter::format_commit(const BinlogEventHeader &) const { return "COMMIT;\n"; }
 
 std::string SqlFormatter::format_insert(const RowsEvent &rows, const TableMetadata &meta) const {
-    std::ostringstream oss;
+    g_sql_buffer.clear();
+    g_sql_buffer.reserve(4096);  // Reserve reasonable default size
     for (const auto &change : rows.rows) {
-        oss << "INSERT INTO " << escape_identifier(meta.schema) << "." << escape_identifier(meta.name) << " (";
+        g_sql_buffer += "INSERT INTO ";
+        g_sql_buffer += escape_identifier(meta.schema);
+        g_sql_buffer += ".";
+        g_sql_buffer += escape_identifier(meta.name);
+        g_sql_buffer += " (";
         bool first = true;
         for (size_t i = 0; i < meta.columns.size(); ++i) {
             if (!change.after.empty() && change.after[i].present) {
-                if (!first) oss << ", ";
+                if (!first) g_sql_buffer += ", ";
                 first = false;
-                oss << escape_identifier(meta.columns[i]);
+                g_sql_buffer += escape_identifier(meta.columns[i]);
             }
         }
-        oss << ") VALUES (";
+        g_sql_buffer += ") VALUES (";
         first = true;
         for (size_t i = 0; i < meta.columns.size(); ++i) {
             if (!change.after.empty() && change.after[i].present) {
-                if (!first) oss << ", ";
+                if (!first) g_sql_buffer += ", ";
                 first = false;
-                oss << escape_value(change.after[i], meta.column_types[i]);
+                g_sql_buffer += escape_value(change.after[i], meta.column_types[i]);
             }
         }
-        oss << ");\n";
+        g_sql_buffer += ");\n";
     }
-    return oss.str();
+    return g_sql_buffer;
 }
 
 std::string SqlFormatter::build_predicate(const RowChange &change, const TableMetadata &meta) const {
-    std::ostringstream oss;
+    thread_local std::string predicate_buffer;
+    predicate_buffer.clear();
+    predicate_buffer.reserve(512);
     bool first = true;
     auto emit_col = [&](size_t idx) {
         if (!change.before[idx].present) return;
-        if (!first) oss << " AND ";
+        if (!first) predicate_buffer += " AND ";
         first = false;
-        oss << escape_identifier(meta.columns[idx]) << " = " << escape_value(change.before[idx], meta.column_types[idx]);
+        predicate_buffer += escape_identifier(meta.columns[idx]);
+        predicate_buffer += " = ";
+        predicate_buffer += escape_value(change.before[idx], meta.column_types[idx]);
     };
 
     for (size_t i = 0; i < meta.columns.size(); ++i) {
@@ -136,33 +156,48 @@ std::string SqlFormatter::build_predicate(const RowChange &change, const TableMe
     if (first) {
         for (size_t i = 0; i < meta.columns.size(); ++i) emit_col(i);
     }
-    return oss.str();
+    return predicate_buffer;
 }
 
 std::string SqlFormatter::format_delete(const RowsEvent &rows, const TableMetadata &meta) const {
-    std::ostringstream oss;
+    g_sql_buffer.clear();
+    g_sql_buffer.reserve(2048);
     for (const auto &change : rows.rows) {
-        oss << "DELETE FROM " << escape_identifier(meta.schema) << "." << escape_identifier(meta.name) << " WHERE "
-            << build_predicate(change, meta) << ";\n";
+        g_sql_buffer += "DELETE FROM ";
+        g_sql_buffer += escape_identifier(meta.schema);
+        g_sql_buffer += ".";
+        g_sql_buffer += escape_identifier(meta.name);
+        g_sql_buffer += " WHERE ";
+        g_sql_buffer += build_predicate(change, meta);
+        g_sql_buffer += ";\n";
     }
-    return oss.str();
+    return g_sql_buffer;
 }
 
 std::string SqlFormatter::format_update(const RowsEvent &rows, const TableMetadata &meta) const {
-    std::ostringstream oss;
+    g_sql_buffer.clear();
+    g_sql_buffer.reserve(4096);
     for (const auto &change : rows.rows) {
-        oss << "UPDATE " << escape_identifier(meta.schema) << "." << escape_identifier(meta.name) << " SET ";
+        g_sql_buffer += "UPDATE ";
+        g_sql_buffer += escape_identifier(meta.schema);
+        g_sql_buffer += ".";
+        g_sql_buffer += escape_identifier(meta.name);
+        g_sql_buffer += " SET ";
         bool first = true;
         for (size_t i = 0; i < meta.columns.size(); ++i) {
             if (!change.after.empty() && change.after[i].present) {
-                if (!first) oss << ", ";
+                if (!first) g_sql_buffer += ", ";
                 first = false;
-                oss << escape_identifier(meta.columns[i]) << " = " << escape_value(change.after[i], meta.column_types[i]);
+                g_sql_buffer += escape_identifier(meta.columns[i]);
+                g_sql_buffer += " = ";
+                g_sql_buffer += escape_value(change.after[i], meta.column_types[i]);
             }
         }
-        oss << " WHERE " << build_predicate(change, meta) << ";\n";
+        g_sql_buffer += " WHERE ";
+        g_sql_buffer += build_predicate(change, meta);
+        g_sql_buffer += ";\n";
     }
-    return oss.str();
+    return g_sql_buffer;
 }
 
 std::string SqlFormatter::format_rows_event(const RowsEvent &rows, const BinlogEventHeader &header) const {
