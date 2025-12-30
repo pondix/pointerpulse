@@ -1,0 +1,36 @@
+# Build directories
+build/
+cmake-build-*/
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+replicapulse
+
+# Test outputs
+Testing/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Checkpoint and lease files
+*.checkpoint
+*.lease
+
+# Docker demo output
+docker/demo/output/*.sql
+docker/demo/output/*.txt
