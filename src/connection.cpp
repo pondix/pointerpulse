@@ -78,16 +78,19 @@ std::vector<uint8_t> scramble_native_password(const std::string &password, const
 }
 
 std::vector<uint8_t> scramble_caching_sha2_password(const std::string &password, const std::vector<uint8_t> &salt) {
+    // MySQL caching_sha2_password algorithm:
+    // SHA256(password) XOR SHA256(SHA256(SHA256(password)) || nonce)
     std::vector<uint8_t> stage1(SHA256_DIGEST_LENGTH);
     SHA256(reinterpret_cast<const unsigned char *>(password.data()), password.size(), stage1.data());
 
     std::vector<uint8_t> stage2(SHA256_DIGEST_LENGTH);
     SHA256(stage1.data(), stage1.size(), stage2.data());
 
+    // CRITICAL: MySQL expects SHA256(stage2 || salt), not SHA256(salt || stage2)
     std::vector<uint8_t> combined;
-    combined.reserve(salt.size() + stage2.size());
-    combined.insert(combined.end(), salt.begin(), salt.end());
+    combined.reserve(stage2.size() + salt.size());
     combined.insert(combined.end(), stage2.begin(), stage2.end());
+    combined.insert(combined.end(), salt.begin(), salt.end());
 
     std::vector<uint8_t> stage3(SHA256_DIGEST_LENGTH);
     SHA256(combined.data(), combined.size(), stage3.data());
@@ -782,11 +785,22 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
     // Handle authentication method negotiation.
     if (auth_resp.payload[0] == 0xfe) {
         std::cerr << "[HANDSHAKE] Authentication requires additional data (AuthSwitchRequest or AuthMoreData)" << std::endl;
+
+        // CRITICAL: Update sequence number after receiving AuthSwitchRequest
+        // The next packet we send must have sequence = server_sequence + 1
+        sequence_ = static_cast<uint8_t>(auth_resp.sequence + 1);
+
         const uint8_t *p = auth_resp.payload.data() + 1;
         const uint8_t *end = auth_resp.payload.data() + auth_resp.payload.size();
         auth_plugin_name.assign(reinterpret_cast<const char*>(p));
         p += auth_plugin_name.size() + 1; // consume name + null terminator
         scramble_buffer_.assign(p, end);
+
+        // Strip trailing null from scramble if present (caching_sha2_password sends 20 bytes + null)
+        if (!scramble_buffer_.empty() && scramble_buffer_.back() == 0x00) {
+            scramble_buffer_.pop_back();
+        }
+
         std::cerr << "[HANDSHAKE] Switched auth plugin to: " << auth_plugin_name << std::endl;
         dump_hex("[HANDSHAKE] New scramble buffer", scramble_buffer_.data(), scramble_buffer_.size());
 
@@ -883,12 +897,120 @@ bool MySQLConnection::request_binlog_stream(uint32_t server_id, const std::strin
     return send_command(COM_BINLOG_DUMP, data);
 }
 
+// Parse UUID string (e.g., "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx") into 16 raw bytes
+bool parse_uuid(const std::string &uuid_str, uint8_t uuid_out[16]) {
+    if (uuid_str.size() != 36) return false;
+    size_t idx = 0;
+    for (size_t i = 0; i < uuid_str.size(); ++i) {
+        if (uuid_str[i] == '-') continue;
+        if (idx >= 32) return false;
+        char hex[3] = {uuid_str[i], '\0', '\0'};
+        if (++i < uuid_str.size() && uuid_str[i] != '-') {
+            hex[1] = uuid_str[i];
+        } else {
+            --i;
+        }
+        char *end = nullptr;
+        unsigned long val = std::strtoul(hex, &end, 16);
+        if (end != hex + (hex[1] ? 2 : 1)) return false;
+        uuid_out[idx / 2] = static_cast<uint8_t>(val);
+        idx += 2;
+    }
+    return idx == 32;
+}
+
+// Encode GTID set from string to MySQL binary format
+// Format: n_sids(8) + for each SID: uuid(16) + n_intervals(8) + intervals(start:8, end_exclusive:8)
+std::vector<uint8_t> encode_gtid_set_binary(const std::string &gtid_set) {
+    std::vector<uint8_t> result;
+    if (gtid_set.empty()) {
+        // No GTIDs: just write n_sids = 0
+        for (int i = 0; i < 8; ++i) result.push_back(0);
+        return result;
+    }
+
+    struct Interval { uint64_t start; uint64_t end; };
+    struct SidEntry { uint8_t uuid[16]; std::vector<Interval> intervals; };
+    std::vector<SidEntry> entries;
+
+    // Parse format: "uuid1:1-100:200-300,uuid2:1-50"
+    std::string current_token;
+    std::vector<std::string> sid_sections;
+    for (size_t i = 0; i <= gtid_set.size(); ++i) {
+        char c = (i < gtid_set.size()) ? gtid_set[i] : ',';
+        if (c == ',') {
+            if (!current_token.empty()) sid_sections.push_back(current_token);
+            current_token.clear();
+        } else if (c != ' ' && c != '\n' && c != '\r') {
+            current_token.push_back(c);
+        }
+    }
+
+    for (const auto &section : sid_sections) {
+        auto colon_pos = section.find(':');
+        if (colon_pos == std::string::npos || colon_pos != 36) continue;
+
+        SidEntry entry;
+        std::string uuid_str = section.substr(0, 36);
+        if (!parse_uuid(uuid_str, entry.uuid)) continue;
+
+        std::string intervals_str = section.substr(37);
+        std::string interval_token;
+        for (size_t i = 0; i <= intervals_str.size(); ++i) {
+            char c = (i < intervals_str.size()) ? intervals_str[i] : ':';
+            if (c == ':') {
+                if (!interval_token.empty()) {
+                    auto dash = interval_token.find('-');
+                    Interval iv;
+                    if (dash == std::string::npos) {
+                        iv.start = std::strtoull(interval_token.c_str(), nullptr, 10);
+                        iv.end = iv.start + 1; // exclusive
+                    } else {
+                        iv.start = std::strtoull(interval_token.substr(0, dash).c_str(), nullptr, 10);
+                        iv.end = std::strtoull(interval_token.substr(dash + 1).c_str(), nullptr, 10) + 1; // exclusive
+                    }
+                    if (iv.start > 0 && iv.end > iv.start) {
+                        entry.intervals.push_back(iv);
+                    }
+                }
+                interval_token.clear();
+            } else {
+                interval_token.push_back(c);
+            }
+        }
+
+        if (!entry.intervals.empty()) {
+            entries.push_back(std::move(entry));
+        }
+    }
+
+    // Write binary format
+    auto write_u64 = [&](uint64_t v) {
+        for (int i = 0; i < 8; ++i) result.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xff));
+    };
+
+    write_u64(entries.size()); // n_sids
+    for (const auto &entry : entries) {
+        result.insert(result.end(), entry.uuid, entry.uuid + 16);
+        write_u64(entry.intervals.size());
+        for (const auto &iv : entry.intervals) {
+            write_u64(iv.start);
+            write_u64(iv.end);
+        }
+    }
+
+    return result;
+}
+
 bool MySQLConnection::request_binlog_stream_gtid(uint32_t server_id, const std::string &binlog_file, uint64_t position,
                                                  const std::string &gtid_set) {
     std::vector<uint8_t> data;
     uint16_t flags = 0;
     uint32_t binlog_name_len = static_cast<uint32_t>(binlog_file.size());
-    uint32_t gtid_len = static_cast<uint32_t>(gtid_set.size());
+
+    // Encode GTID set to binary format (MySQL protocol requirement)
+    std::vector<uint8_t> gtid_binary = encode_gtid_set_binary(gtid_set);
+    uint32_t gtid_len = static_cast<uint32_t>(gtid_binary.size());
 
     data.reserve(18 + binlog_name_len + gtid_len);
     data.push_back(flags & 0xff);
@@ -910,7 +1032,7 @@ bool MySQLConnection::request_binlog_stream_gtid(uint32_t server_id, const std::
     data.push_back((gtid_len >> 8) & 0xff);
     data.push_back((gtid_len >> 16) & 0xff);
     data.push_back((gtid_len >> 24) & 0xff);
-    data.insert(data.end(), gtid_set.begin(), gtid_set.end());
+    data.insert(data.end(), gtid_binary.begin(), gtid_binary.end());
 
     return send_command(COM_BINLOG_DUMP_GTID, data);
 }
