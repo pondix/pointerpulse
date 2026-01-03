@@ -349,23 +349,33 @@ CellValue decode_cell(const TableMetadata &meta, size_t idx, const uint8_t *&p) 
         break;
     }
     case ColumnType::TIME2: {
-        int64_t v = read_signed(p, 3);
+        // TIME2 is big-endian packed:
+        // 3 bytes: sign(1) + hour(10) + minute(6) + second(6) = 23 bits, stored in 24 bits
+        // Bit 23 is sign (1=positive, 0=negative), value stored as unsigned with 0x800000 bias
+        uint32_t raw = (static_cast<uint32_t>(p[0]) << 16) |
+                       (static_cast<uint32_t>(p[1]) << 8) |
+                       static_cast<uint32_t>(p[2]);
         p += 3;
         int fbytes = fractional_bytes(meta_val);
         uint32_t fractional = 0;
         for (int i = 0; i < fbytes; ++i) fractional = (fractional << 8) | *p++;
-        bool neg = v < 0;
-        if (neg) v = -v;
-        int64_t total_seconds = v / 1000000;
-        int h = static_cast<int>(total_seconds / 3600);
-        int m = static_cast<int>((total_seconds % 3600) / 60);
-        int s = static_cast<int>(total_seconds % 60);
+
+        bool neg = (raw & 0x800000) == 0;
+        int32_t packed = neg ? (0x800000 - (raw & 0x7fffff)) : (raw - 0x800000);
+        if (packed < 0) packed = -packed;
+
+        int h = (packed >> 12) & 0x3ff;
+        int m = (packed >> 6) & 0x3f;
+        int s = packed & 0x3f;
         char buf[40];
-        if (fbytes)
-            std::snprintf(buf, sizeof(buf), "%s%02d:%02d:%02d.%06u", neg ? "-" : "", h, m, s,
-                          fractional * static_cast<uint32_t>(std::pow(10, 6 - meta_val)));
-        else
+        if (fbytes > 0) {
+            uint32_t frac_scaled = fractional;
+            // Scale fractional to 6 digits based on FSP
+            for (int i = meta_val; i < 6; ++i) frac_scaled *= 10;
+            std::snprintf(buf, sizeof(buf), "%s%02d:%02d:%02d.%0*u", neg ? "-" : "", h, m, s, meta_val, frac_scaled / (meta_val < 6 ? 1 : 1));
+        } else {
             std::snprintf(buf, sizeof(buf), "%s%02d:%02d:%02d", neg ? "-" : "", h, m, s);
+        }
         cell.as_string = buf;
         break;
     }
@@ -411,14 +421,20 @@ CellValue decode_cell(const TableMetadata &meta, size_t idx, const uint8_t *&p) 
         break;
     }
     case ColumnType::TIMESTAMP2: {
-        uint32_t v = read_uint32(p);
+        // TIMESTAMP2 stores the unix timestamp in big-endian (4 bytes)
+        uint32_t v = (static_cast<uint32_t>(p[0]) << 24) |
+                     (static_cast<uint32_t>(p[1]) << 16) |
+                     (static_cast<uint32_t>(p[2]) << 8) |
+                     static_cast<uint32_t>(p[3]);
         p += 4;
         uint32_t fractional = 0;
         int fbytes = fractional_bytes(meta_val);
         for (int i = 0; i < fbytes; ++i) fractional = (fractional << 8) | *p++;
-        if (fbytes) {
+        if (fbytes > 0) {
             char buf[32];
-            std::snprintf(buf, sizeof(buf), "%u.%06u", v, fractional * static_cast<uint32_t>(std::pow(10, 6 - meta_val)));
+            uint32_t frac_scaled = fractional;
+            for (int i = meta_val; i < 6; ++i) frac_scaled *= 10;
+            std::snprintf(buf, sizeof(buf), "%u.%0*u", v, meta_val, fractional);
             cell.as_string = buf;
         } else {
             cell.as_string = std::to_string(v);
@@ -437,10 +453,15 @@ CellValue decode_cell(const TableMetadata &meta, size_t idx, const uint8_t *&p) 
     case ColumnType::VAR_STRING:
     case ColumnType::VARCHAR:
     case ColumnType::STRING: {
+        // MySQL uses 1-byte length for max_length <= 255, 2-byte for > 255
         uint16_t maxlen = meta_val;
-        (void)maxlen;
-        uint16_t len = read_uint16(p);
-        p += 2;
+        uint16_t len;
+        if (maxlen > 255) {
+            len = read_uint16(p);
+            p += 2;
+        } else {
+            len = *p++;
+        }
         cell.as_string.assign(reinterpret_cast<const char *>(p), len);
         cell.raw.assign(p, p + len);
         p += len;
@@ -459,8 +480,17 @@ CellValue decode_cell(const TableMetadata &meta, size_t idx, const uint8_t *&p) 
     case ColumnType::BLOB:
     case ColumnType::TINY_BLOB:
     case ColumnType::MEDIUM_BLOB:
-    case ColumnType::LONG_BLOB: {
-        uint64_t len = read_lenenc_int(p, p + 9);
+    case ColumnType::LONG_BLOB:
+    case ColumnType::GEOMETRY: {
+        // MySQL BLOB length prefix is determined by metadata:
+        // meta_val specifies the number of bytes for the length field (1-4)
+        // TINYBLOB=1, BLOB=2, MEDIUMBLOB=3, LONGBLOB=4
+        uint8_t len_bytes = static_cast<uint8_t>(meta_val ? meta_val : 2);
+        uint64_t len = 0;
+        for (uint8_t i = 0; i < len_bytes && i < 4; ++i) {
+            len |= static_cast<uint64_t>(p[i]) << (8 * i);
+        }
+        p += len_bytes;
         cell.raw.assign(p, p + len);
         cell.as_string.assign(reinterpret_cast<const char *>(p), len);
         p += len;
@@ -546,6 +576,15 @@ bool BinlogParser::parse_event(const std::vector<uint8_t> &data, BinlogEvent &ev
     case EventType::GTID_EVENT:
     case EventType::ANONYMOUS_GTID_EVENT:
         ok = parse_gtid_event(*payload, event);
+        break;
+    case EventType::PARTIAL_UPDATE_ROWS_EVENT:
+        // MySQL 8.0 partial JSON update - treat like UPDATE_ROWS_V2
+        ok = parse_rows_event(*payload, event, true, false);
+        break;
+    case EventType::TRANSACTION_PAYLOAD_EVENT:
+        // MySQL 8.0.20+ compressed transaction payload - skip for now
+        // Would require zstd decompression and recursive event parsing
+        ok = true;
         break;
     case EventType::PREVIOUS_GTIDS_EVENT:
         ok = parse_previous_gtids_event(*payload, event);
@@ -640,24 +679,79 @@ bool BinlogParser::parse_table_map_event(const std::vector<uint8_t> &data, Binlo
     for (size_t i = 0; i < column_count; ++i) map.column_types.push_back(static_cast<ColumnType>(*p++));
     uint64_t metadata_len = read_lenenc_int(p, end);
     const uint8_t *metadata_end = p + metadata_len;
-    for (size_t i = 0; i < column_count; ++i) {
+    for (size_t i = 0; i < column_count && p < metadata_end; ++i) {
         uint16_t meta = 0;
         switch (map.column_types[i]) {
+        // 2-byte metadata types
         case ColumnType::VARCHAR:
-        case ColumnType::STRING:
         case ColumnType::VAR_STRING:
+            // max_length in 2 bytes (little-endian)
             meta = read_uint16(p);
             p += 2;
             break;
+        case ColumnType::STRING:
+            // First byte is real_type, second is field_length
+            // For ENUM/SET, real_type indicates pack_length
+            meta = (static_cast<uint16_t>(p[0]) << 8) | p[1];
+            p += 2;
+            break;
         case ColumnType::NEWDECIMAL:
-            meta = (p[0] << 8) | p[1];
+            // precision in first byte, scale in second (big-endian)
+            meta = (static_cast<uint16_t>(p[0]) << 8) | p[1];
             p += 2;
             break;
         case ColumnType::BIT:
-            meta = (p[0] << 8) | p[1];
+            // bits%8 in first byte, bits/8 in second byte
+            meta = (static_cast<uint16_t>(p[0]) << 8) | p[1];
             p += 2;
             break;
+        // 1-byte metadata types
+        case ColumnType::FLOAT:
+        case ColumnType::DOUBLE:
+            // Size in bytes (4 or 8)
+            meta = *p++;
+            break;
+        case ColumnType::BLOB:
+        case ColumnType::GEOMETRY:
+        case ColumnType::JSON:
+            // Number of bytes for length prefix (1-4)
+            meta = *p++;
+            break;
+        case ColumnType::TINY_BLOB:
+        case ColumnType::MEDIUM_BLOB:
+        case ColumnType::LONG_BLOB:
+            // Pack length
+            meta = *p++;
+            break;
+        case ColumnType::TIMESTAMP2:
+        case ColumnType::DATETIME2:
+        case ColumnType::TIME2:
+            // FSP (fractional second precision 0-6)
+            meta = *p++;
+            break;
+        case ColumnType::ENUM:
+        case ColumnType::SET:
+            // Pack length (1 or 2 bytes for value storage)
+            meta = *p++;
+            break;
+        // No metadata types
+        case ColumnType::DECIMAL:
+        case ColumnType::TINY:
+        case ColumnType::SHORT:
+        case ColumnType::LONG:
+        case ColumnType::LONGLONG:
+        case ColumnType::INT24:
+        case ColumnType::YEAR:
+        case ColumnType::DATE:
+        case ColumnType::TIME:
+        case ColumnType::DATETIME:
+        case ColumnType::TIMESTAMP:
+        case ColumnType::NULL_TYPE:
+            // These types have no metadata
+            meta = 0;
+            break;
         default:
+            // Unknown type, try reading 1 byte
             meta = *p++;
             break;
         }
