@@ -120,6 +120,26 @@ uint64_t read_lenenc_int(const uint8_t *&p, const uint8_t *end) {
     return 0;
 }
 
+void write_lenenc_int(std::vector<uint8_t> &out, uint64_t value) {
+    if (value < 0xfb) {
+        out.push_back(static_cast<uint8_t>(value));
+    } else if (value <= 0xffff) {
+        out.push_back(0xfc);
+        out.push_back(static_cast<uint8_t>(value & 0xff));
+        out.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
+    } else if (value <= 0xffffff) {
+        out.push_back(0xfd);
+        out.push_back(static_cast<uint8_t>(value & 0xff));
+        out.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
+        out.push_back(static_cast<uint8_t>((value >> 16) & 0xff));
+    } else {
+        out.push_back(0xfe);
+        for (int i = 0; i < 8; ++i) {
+            out.push_back(static_cast<uint8_t>((value >> (8 * i)) & 0xff));
+        }
+    }
+}
+
 std::string read_lenenc_string(const uint8_t *&p, const uint8_t *end) {
     uint64_t len = read_lenenc_int(p, end);
     if (p + len > end) len = end - p;
@@ -310,10 +330,15 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
     uint8_t protocol_version = *ptr++;
     std::cerr << "[HANDSHAKE] Protocol version: " << static_cast<int>(protocol_version) << std::endl;
 
-    std::string server_version(reinterpret_cast<const char *>(ptr));
+    const uint8_t *server_ver_end = std::find(ptr, end, static_cast<uint8_t>(0));
+    if (server_ver_end == end) {
+        std::cerr << "[HANDSHAKE ERROR] Server version string not null-terminated" << std::endl;
+        return false;
+    }
+    std::string server_version(reinterpret_cast<const char *>(ptr), server_ver_end - ptr);
     std::cerr << "[HANDSHAKE] Server version: " << server_version << std::endl;
 
-    ptr += server_version.size() + 1;
+    ptr = server_ver_end + 1;
     if (ptr + 4 > end) {
         std::cerr << "[HANDSHAKE ERROR] Packet too short for connection ID" << std::endl;
         return false;
@@ -341,44 +366,113 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
     uint16_t capability_flags2 = 0;
     uint8_t auth_plugin_data_len = 0;
     std::string auth_plugin_name = "mysql_native_password";
-    if (ptr < end) {
-        if (ptr + 2 > end) {
-            std::cerr << "[HANDSHAKE ERROR] Packet too short for extended capability flags" << std::endl;
-            return false;
-        }
-        capability_flags2 = read_uint2(ptr);
-        ptr += 2;
-        uint32_t server_cap = capability_flags1 | (static_cast<uint32_t>(capability_flags2) << 16);
-        std::cerr << "[HANDSHAKE] Server capabilities: 0x" << std::hex << server_cap << std::dec << std::endl;
+    if (ptr + 1 > end) {
+        std::cerr << "[HANDSHAKE ERROR] Packet too short for character set" << std::endl;
+        return false;
+    }
+    uint8_t character_set = *ptr++;
+    (void)character_set; // currently unused
 
-        if (ptr < end) {
-            auth_plugin_data_len = *ptr;
-            std::cerr << "[HANDSHAKE] Auth plugin data length: " << static_cast<int>(auth_plugin_data_len) << std::endl;
-            ptr += 10; // reserved bytes
-            if (server_cap & CLIENT_PLUGIN_AUTH) {
-                size_t len = std::max<size_t>(13, auth_plugin_data_len > 8 ? auth_plugin_data_len - 8 : 0);
-                if (ptr + len > end) {
-                    std::cerr << "[HANDSHAKE ERROR] Packet too short for auth-plugin-data-part-2 (need " << len << " bytes)" << std::endl;
-                    return false;
-                }
-                // Insert all but the last byte (which is a null terminator)
-                size_t scramble_len = len > 0 ? len - 1 : 0;
-                scramble.insert(scramble.end(), ptr, ptr + scramble_len);
-                ptr += len;
-            } else {
-                size_t len = 13; // second part fallback (12 bytes + 1 null terminator)
-                if (ptr + len > end) {
-                    std::cerr << "[HANDSHAKE ERROR] Packet too short for auth-plugin-data-part-2 fallback (need " << len << " bytes)" << std::endl;
-                    return false;
-                }
-                // Insert only 12 bytes, excluding the null terminator
-                scramble.insert(scramble.end(), ptr, ptr + 12);
-                ptr += len;
-            }
-            if (server_cap & CLIENT_PLUGIN_AUTH && ptr < end) {
-                auth_plugin_name.assign(reinterpret_cast<const char *>(ptr));
-            }
+    if (ptr + 2 > end) {
+        std::cerr << "[HANDSHAKE ERROR] Packet too short for status flags" << std::endl;
+        return false;
+    }
+    uint16_t status_flags = read_uint2(ptr);
+    ptr += 2;
+    (void)status_flags; // currently unused
+
+    if (ptr + 2 > end) {
+        std::cerr << "[HANDSHAKE ERROR] Packet too short for extended capability flags" << std::endl;
+        return false;
+    }
+    capability_flags2 = read_uint2(ptr);
+    ptr += 2;
+    uint32_t server_cap = capability_flags1 | (static_cast<uint32_t>(capability_flags2) << 16);
+    std::cerr << "[HANDSHAKE] Server capabilities: 0x" << std::hex << server_cap << std::dec << std::endl;
+
+    if (ptr >= end) {
+        std::cerr << "[HANDSHAKE ERROR] Packet too short for auth plugin data length" << std::endl;
+        return false;
+    }
+    auth_plugin_data_len = *ptr++;
+    std::cerr << "[HANDSHAKE] Auth plugin data length: " << static_cast<int>(auth_plugin_data_len) << std::endl;
+
+    if (ptr + 10 > end) {
+        std::cerr << "[HANDSHAKE ERROR] Packet too short for reserved bytes" << std::endl;
+        return false;
+    }
+    ptr += 10; // reserved bytes
+
+    size_t auth_plugin_data_total_len = auth_plugin_data_len;
+    if ((server_cap & CLIENT_PLUGIN_AUTH) && auth_plugin_data_total_len < 8) {
+        // Servers occasionally emit 0 here even though 20 bytes follow. Fall back
+        // to the protocol default (20 bytes of scramble plus null terminator).
+        auth_plugin_data_total_len = 21;
+        std::cerr << "[HANDSHAKE WARNING] Auth plugin data length missing/too small; using default 21" << std::endl;
+    }
+
+    const uint8_t *plugin_name_start = end;
+    bool plugin_name_terminated = false;
+    if (server_cap & CLIENT_PLUGIN_AUTH) {
+        // Plugin name is the last field and null-terminated. Walk backward to
+        // separate it from the scramble data even when the advertised auth
+        // plugin data length is missing or incorrect.
+        const uint8_t *scan = end;
+        if (scan > ptr && *(scan - 1) == 0x00) {
+            plugin_name_terminated = true;
+            --scan; // drop terminator
+        } else {
+            std::cerr << "[HANDSHAKE WARNING] Auth plugin name missing null terminator; falling back to default" << std::endl;
         }
+
+        while (scan > ptr && *(scan - 1) != 0x00) {
+            --scan;
+        }
+
+        if (plugin_name_terminated) {
+            plugin_name_start = scan;
+            size_t plugin_len = (end - 1) - plugin_name_start;
+            auth_plugin_name.assign(reinterpret_cast<const char *>(plugin_name_start), plugin_len);
+            if (auth_plugin_name.empty()) {
+                auth_plugin_name = "mysql_native_password";
+                std::cerr << "[HANDSHAKE WARNING] Empty auth plugin name received; using default mysql_native_password" << std::endl;
+            }
+        } else {
+            // No terminator present. Treat the remaining payload as scramble
+            // data and keep the default plugin to avoid mis-parsing random
+            // bytes as a plugin name.
+            plugin_name_start = end;
+        }
+    }
+
+    // Consume the remaining data between the reserved bytes and the plugin name
+    // as the second part of the scramble. Clamp to the advertised length when
+    // possible, but never read past the plugin name boundary discovered above.
+    size_t part2_len = plugin_name_start > ptr ? static_cast<size_t>(plugin_name_start - ptr) : 0;
+    if (server_cap & CLIENT_SECURE_CONNECTION) {
+        size_t expected_len = std::max<size_t>(13, auth_plugin_data_total_len > 8 ? auth_plugin_data_total_len - 8 : 0);
+        if (part2_len < expected_len) {
+            std::cerr << "[HANDSHAKE WARNING] Auth-plugin-data-part-2 truncated; expected at least "
+                      << expected_len << " bytes but only " << part2_len << " available" << std::endl;
+        }
+        if (part2_len > 0 && ptr[part2_len - 1] == 0x00) {
+            --part2_len; // drop trailing null terminator
+        }
+        scramble.insert(scramble.end(), ptr, ptr + part2_len);
+        ptr = plugin_name_start;
+    } else {
+        size_t fallback_len = std::min<size_t>(12, part2_len);
+        scramble.insert(scramble.end(), ptr, ptr + fallback_len);
+        ptr = plugin_name_start;
+    }
+
+    // Some servers append a trailing null in the combined scramble. Limit to the
+    // maximum scramble size expected by the protocol to avoid bleeding into the
+    // plugin name field when the server omits auth-plugin-data length.
+    if (scramble.size() > 20) {
+        scramble.resize(20);
+    } else if (!scramble.empty() && scramble.back() == 0x00) {
+        scramble.pop_back();
     }
     scramble_buffer_ = scramble;
 
@@ -465,9 +559,8 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
     dump_hex("[HANDSHAKE] Auth token", token.data(), token.size());
 
     if (capability & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) {
-        uint8_t len = static_cast<uint8_t>(token.size());
-        response.push_back(len);
-        std::cerr << "[HANDSHAKE] Using lenenc format for auth data (length: " << static_cast<int>(len) << ")" << std::endl;
+        write_lenenc_int(response, token.size());
+        std::cerr << "[HANDSHAKE] Using lenenc format for auth data (length: " << token.size() << ")" << std::endl;
     } else {
         response.push_back(static_cast<uint8_t>(token.size()));
         std::cerr << "[HANDSHAKE] Using standard format for auth data (length: " << static_cast<int>(token.size()) << ")" << std::endl;
@@ -545,7 +638,15 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
         return false;
     }
 
-    std::cerr << "[HANDSHAKE] Received authentication response, size: " << auth_resp.payload.size() << " bytes" << std::endl;
+    auto read_next_auth = [&](const char *context) -> bool {
+        if (!read_packet(auth_resp) || auth_resp.payload.empty()) {
+            std::cerr << "[HANDSHAKE ERROR] Failed to read authentication response packet from server" << std::endl;
+            return false;
+        }
+
+        // Align client sequence with the next expected packet after the
+        // server response we just consumed.
+        sequence_ = static_cast<uint8_t>(auth_resp.sequence + 1);
 
     dump_hex("[HANDSHAKE] Auth response packet", auth_resp.payload.data(), auth_resp.payload.size());
     std::cerr << "[HANDSHAKE] Response packet type: 0x" << std::hex << static_cast<int>(auth_resp.payload[0]) << std::dec << std::endl;
