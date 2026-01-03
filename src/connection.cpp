@@ -9,6 +9,7 @@
 #include <openssl/sha.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/pem.h>
 
 #include <algorithm>
 #include <cstring>
@@ -117,6 +118,26 @@ uint64_t read_lenenc_int(const uint8_t *&p, const uint8_t *end) {
         return v;
     }
     return 0;
+}
+
+void write_lenenc_int(std::vector<uint8_t> &out, uint64_t value) {
+    if (value < 0xfb) {
+        out.push_back(static_cast<uint8_t>(value));
+    } else if (value <= 0xffff) {
+        out.push_back(0xfc);
+        out.push_back(static_cast<uint8_t>(value & 0xff));
+        out.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
+    } else if (value <= 0xffffff) {
+        out.push_back(0xfd);
+        out.push_back(static_cast<uint8_t>(value & 0xff));
+        out.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
+        out.push_back(static_cast<uint8_t>((value >> 16) & 0xff));
+    } else {
+        out.push_back(0xfe);
+        for (int i = 0; i < 8; ++i) {
+            out.push_back(static_cast<uint8_t>((value >> (8 * i)) & 0xff));
+        }
+    }
 }
 
 std::string read_lenenc_string(const uint8_t *&p, const uint8_t *end) {
@@ -309,10 +330,15 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
     uint8_t protocol_version = *ptr++;
     std::cerr << "[HANDSHAKE] Protocol version: " << static_cast<int>(protocol_version) << std::endl;
 
-    std::string server_version(reinterpret_cast<const char *>(ptr));
+    const uint8_t *server_ver_end = std::find(ptr, end, static_cast<uint8_t>(0));
+    if (server_ver_end == end) {
+        std::cerr << "[HANDSHAKE ERROR] Server version string not null-terminated" << std::endl;
+        return false;
+    }
+    std::string server_version(reinterpret_cast<const char *>(ptr), server_ver_end - ptr);
     std::cerr << "[HANDSHAKE] Server version: " << server_version << std::endl;
 
-    ptr += server_version.size() + 1;
+    ptr = server_ver_end + 1;
     if (ptr + 4 > end) {
         std::cerr << "[HANDSHAKE ERROR] Packet too short for connection ID" << std::endl;
         return false;
@@ -340,44 +366,113 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
     uint16_t capability_flags2 = 0;
     uint8_t auth_plugin_data_len = 0;
     std::string auth_plugin_name = "mysql_native_password";
-    if (ptr < end) {
-        if (ptr + 2 > end) {
-            std::cerr << "[HANDSHAKE ERROR] Packet too short for extended capability flags" << std::endl;
-            return false;
-        }
-        capability_flags2 = read_uint2(ptr);
-        ptr += 2;
-        uint32_t server_cap = capability_flags1 | (static_cast<uint32_t>(capability_flags2) << 16);
-        std::cerr << "[HANDSHAKE] Server capabilities: 0x" << std::hex << server_cap << std::dec << std::endl;
+    if (ptr + 1 > end) {
+        std::cerr << "[HANDSHAKE ERROR] Packet too short for character set" << std::endl;
+        return false;
+    }
+    uint8_t character_set = *ptr++;
+    (void)character_set; // currently unused
 
-        if (ptr < end) {
-            auth_plugin_data_len = *ptr;
-            std::cerr << "[HANDSHAKE] Auth plugin data length: " << static_cast<int>(auth_plugin_data_len) << std::endl;
-            ptr += 10; // reserved bytes
-            if (server_cap & CLIENT_PLUGIN_AUTH) {
-                size_t len = std::max<size_t>(13, auth_plugin_data_len > 8 ? auth_plugin_data_len - 8 : 0);
-                if (ptr + len > end) {
-                    std::cerr << "[HANDSHAKE ERROR] Packet too short for auth-plugin-data-part-2 (need " << len << " bytes)" << std::endl;
-                    return false;
-                }
-                // Insert all but the last byte (which is a null terminator)
-                size_t scramble_len = len > 0 ? len - 1 : 0;
-                scramble.insert(scramble.end(), ptr, ptr + scramble_len);
-                ptr += len;
-            } else {
-                size_t len = 13; // second part fallback (12 bytes + 1 null terminator)
-                if (ptr + len > end) {
-                    std::cerr << "[HANDSHAKE ERROR] Packet too short for auth-plugin-data-part-2 fallback (need " << len << " bytes)" << std::endl;
-                    return false;
-                }
-                // Insert only 12 bytes, excluding the null terminator
-                scramble.insert(scramble.end(), ptr, ptr + 12);
-                ptr += len;
-            }
-            if (server_cap & CLIENT_PLUGIN_AUTH && ptr < end) {
-                auth_plugin_name.assign(reinterpret_cast<const char *>(ptr));
-            }
+    if (ptr + 2 > end) {
+        std::cerr << "[HANDSHAKE ERROR] Packet too short for status flags" << std::endl;
+        return false;
+    }
+    uint16_t status_flags = read_uint2(ptr);
+    ptr += 2;
+    (void)status_flags; // currently unused
+
+    if (ptr + 2 > end) {
+        std::cerr << "[HANDSHAKE ERROR] Packet too short for extended capability flags" << std::endl;
+        return false;
+    }
+    capability_flags2 = read_uint2(ptr);
+    ptr += 2;
+    uint32_t server_cap = capability_flags1 | (static_cast<uint32_t>(capability_flags2) << 16);
+    std::cerr << "[HANDSHAKE] Server capabilities: 0x" << std::hex << server_cap << std::dec << std::endl;
+
+    if (ptr >= end) {
+        std::cerr << "[HANDSHAKE ERROR] Packet too short for auth plugin data length" << std::endl;
+        return false;
+    }
+    auth_plugin_data_len = *ptr++;
+    std::cerr << "[HANDSHAKE] Auth plugin data length: " << static_cast<int>(auth_plugin_data_len) << std::endl;
+
+    if (ptr + 10 > end) {
+        std::cerr << "[HANDSHAKE ERROR] Packet too short for reserved bytes" << std::endl;
+        return false;
+    }
+    ptr += 10; // reserved bytes
+
+    size_t auth_plugin_data_total_len = auth_plugin_data_len;
+    if ((server_cap & CLIENT_PLUGIN_AUTH) && auth_plugin_data_total_len < 8) {
+        // Servers occasionally emit 0 here even though 20 bytes follow. Fall back
+        // to the protocol default (20 bytes of scramble plus null terminator).
+        auth_plugin_data_total_len = 21;
+        std::cerr << "[HANDSHAKE WARNING] Auth plugin data length missing/too small; using default 21" << std::endl;
+    }
+
+    const uint8_t *plugin_name_start = end;
+    bool plugin_name_terminated = false;
+    if (server_cap & CLIENT_PLUGIN_AUTH) {
+        // Plugin name is the last field and null-terminated. Walk backward to
+        // separate it from the scramble data even when the advertised auth
+        // plugin data length is missing or incorrect.
+        const uint8_t *scan = end;
+        if (scan > ptr && *(scan - 1) == 0x00) {
+            plugin_name_terminated = true;
+            --scan; // drop terminator
+        } else {
+            std::cerr << "[HANDSHAKE WARNING] Auth plugin name missing null terminator; falling back to default" << std::endl;
         }
+
+        while (scan > ptr && *(scan - 1) != 0x00) {
+            --scan;
+        }
+
+        if (plugin_name_terminated) {
+            plugin_name_start = scan;
+            size_t plugin_len = (end - 1) - plugin_name_start;
+            auth_plugin_name.assign(reinterpret_cast<const char *>(plugin_name_start), plugin_len);
+            if (auth_plugin_name.empty()) {
+                auth_plugin_name = "mysql_native_password";
+                std::cerr << "[HANDSHAKE WARNING] Empty auth plugin name received; using default mysql_native_password" << std::endl;
+            }
+        } else {
+            // No terminator present. Treat the remaining payload as scramble
+            // data and keep the default plugin to avoid mis-parsing random
+            // bytes as a plugin name.
+            plugin_name_start = end;
+        }
+    }
+
+    // Consume the remaining data between the reserved bytes and the plugin name
+    // as the second part of the scramble. Clamp to the advertised length when
+    // possible, but never read past the plugin name boundary discovered above.
+    size_t part2_len = plugin_name_start > ptr ? static_cast<size_t>(plugin_name_start - ptr) : 0;
+    if (server_cap & CLIENT_SECURE_CONNECTION) {
+        size_t expected_len = std::max<size_t>(13, auth_plugin_data_total_len > 8 ? auth_plugin_data_total_len - 8 : 0);
+        if (part2_len < expected_len) {
+            std::cerr << "[HANDSHAKE WARNING] Auth-plugin-data-part-2 truncated; expected at least "
+                      << expected_len << " bytes but only " << part2_len << " available" << std::endl;
+        }
+        if (part2_len > 0 && ptr[part2_len - 1] == 0x00) {
+            --part2_len; // drop trailing null terminator
+        }
+        scramble.insert(scramble.end(), ptr, ptr + part2_len);
+        ptr = plugin_name_start;
+    } else {
+        size_t fallback_len = std::min<size_t>(12, part2_len);
+        scramble.insert(scramble.end(), ptr, ptr + fallback_len);
+        ptr = plugin_name_start;
+    }
+
+    // Some servers append a trailing null in the combined scramble. Limit to the
+    // maximum scramble size expected by the protocol to avoid bleeding into the
+    // plugin name field when the server omits auth-plugin-data length.
+    if (scramble.size() > 20) {
+        scramble.resize(20);
+    } else if (!scramble.empty() && scramble.back() == 0x00) {
+        scramble.pop_back();
     }
     scramble_buffer_ = scramble;
 
@@ -415,6 +510,12 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
 
     uint32_t capability = desired & server_capability;
     std::cerr << "[HANDSHAKE] Final negotiated capabilities: 0x" << std::hex << capability << std::dec << std::endl;
+
+    // The initial server handshake packet is sequence 0. The next outgoing
+    // packet from the client must start at sequence 1. When TLS is requested
+    // an SSLRequest packet (seq=1) is sent, followed by the actual handshake
+    // response (seq=2).
+    sequence_ = 1;
 
     if ((capability & CLIENT_SSL) && use_tls_) {
         std::cerr << "[HANDSHAKE] Setting up TLS connection..." << std::endl;
@@ -458,9 +559,8 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
     dump_hex("[HANDSHAKE] Auth token", token.data(), token.size());
 
     if (capability & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) {
-        uint8_t len = static_cast<uint8_t>(token.size());
-        response.push_back(len);
-        std::cerr << "[HANDSHAKE] Using lenenc format for auth data (length: " << static_cast<int>(len) << ")" << std::endl;
+        write_lenenc_int(response, token.size());
+        std::cerr << "[HANDSHAKE] Using lenenc format for auth data (length: " << token.size() << ")" << std::endl;
     } else {
         response.push_back(static_cast<uint8_t>(token.size()));
         std::cerr << "[HANDSHAKE] Using standard format for auth data (length: " << static_cast<int>(token.size()) << ")" << std::endl;
@@ -482,73 +582,213 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
 
     std::cerr << "[HANDSHAKE] Waiting for authentication response from server..." << std::endl;
 
-    Packet auth_resp;
-    if (!read_packet(auth_resp)) {
-        std::cerr << "[HANDSHAKE ERROR] Failed to read authentication response packet from server" << std::endl;
-        return false;
-    }
+    auto fail_with_packet = [&](const Packet &auth_resp) {
+        std::cerr << "[HANDSHAKE] Response packet type: 0x" << std::hex
+                  << static_cast<int>(auth_resp.payload[0]) << std::dec << std::endl;
+        if (auth_resp.payload[0] == 0xff) {
+            std::cerr << "[HANDSHAKE ERROR] ========================================" << std::endl;
+            std::cerr << "[HANDSHAKE ERROR] AUTHENTICATION FAILED - MySQL Error Packet" << std::endl;
+            std::cerr << "[HANDSHAKE ERROR] ========================================" << std::endl;
 
-    std::cerr << "[HANDSHAKE] Received authentication response, size: " << auth_resp.payload.size() << " bytes" << std::endl;
+            if (auth_resp.payload.size() >= 3) {
+                uint16_t error_code = auth_resp.payload[1] | (auth_resp.payload[2] << 8);
+                std::cerr << "[HANDSHAKE ERROR] MySQL Error Code: " << error_code << std::endl;
 
-    if (auth_resp.payload.empty()) {
-        std::cerr << "[HANDSHAKE ERROR] Authentication response packet is empty" << std::endl;
-        return false;
-    }
+                // Parse error message
+                if (auth_resp.payload.size() > 3) {
+                    size_t msg_start = 3;
+                    // Check for SQL state marker '#'
+                    if (auth_resp.payload.size() > 9 && auth_resp.payload[3] == '#') {
+                        std::string sql_state(reinterpret_cast<const char*>(&auth_resp.payload[4]), 5);
+                        std::cerr << "[HANDSHAKE ERROR] SQL State: " << sql_state << std::endl;
+                        msg_start = 9;
+                    }
 
-    dump_hex("[HANDSHAKE] Auth response packet", auth_resp.payload.data(), auth_resp.payload.size());
-
-    // Log the first byte to see what kind of packet we got
-    std::cerr << "[HANDSHAKE] Response packet type: 0x" << std::hex << static_cast<int>(auth_resp.payload[0]) << std::dec << std::endl;
-
-    if (auth_resp.payload[0] == 0xff) {
-        // Error packet - extract detailed error information
-        std::cerr << "[HANDSHAKE ERROR] ========================================" << std::endl;
-        std::cerr << "[HANDSHAKE ERROR] AUTHENTICATION FAILED - MySQL Error Packet" << std::endl;
-        std::cerr << "[HANDSHAKE ERROR] ========================================" << std::endl;
-
-        if (auth_resp.payload.size() >= 3) {
-            uint16_t error_code = auth_resp.payload[1] | (auth_resp.payload[2] << 8);
-            std::cerr << "[HANDSHAKE ERROR] MySQL Error Code: " << error_code << std::endl;
-
-            // Parse error message
-            if (auth_resp.payload.size() > 3) {
-                size_t msg_start = 3;
-                // Check for SQL state marker '#'
-                if (auth_resp.payload.size() > 9 && auth_resp.payload[3] == '#') {
-                    std::string sql_state(reinterpret_cast<const char*>(&auth_resp.payload[4]), 5);
-                    std::cerr << "[HANDSHAKE ERROR] SQL State: " << sql_state << std::endl;
-                    msg_start = 9;
-                }
-
-                if (auth_resp.payload.size() > msg_start) {
-                    std::string error_message(reinterpret_cast<const char*>(&auth_resp.payload[msg_start]),
-                                             auth_resp.payload.size() - msg_start);
-                    std::cerr << "[HANDSHAKE ERROR] Error Message: " << error_message << std::endl;
+                    if (auth_resp.payload.size() > msg_start) {
+                        std::string error_message(reinterpret_cast<const char*>(&auth_resp.payload[msg_start]),
+                                                 auth_resp.payload.size() - msg_start);
+                        std::cerr << "[HANDSHAKE ERROR] Error Message: " << error_message << std::endl;
+                    }
                 }
             }
+
+            std::cerr << "[HANDSHAKE ERROR] ========================================" << std::endl;
+            std::cerr << "[HANDSHAKE ERROR] Troubleshooting Information:" << std::endl;
+            std::cerr << "[HANDSHAKE ERROR]   - User: " << user << std::endl;
+            std::cerr << "[HANDSHAKE ERROR]   - Host: " << host << std::endl;
+            std::cerr << "[HANDSHAKE ERROR]   - Auth Plugin: " << auth_plugin_name << std::endl;
+            std::cerr << "[HANDSHAKE ERROR]   - Scramble Buffer Size: " << scramble_buffer_.size() << " bytes" << std::endl;
+            std::cerr << "[HANDSHAKE ERROR]   - Token Size: " << token.size() << " bytes" << std::endl;
+            std::cerr << "[HANDSHAKE ERROR] ========================================" << std::endl;
+            return false;
         }
 
-        std::cerr << "[HANDSHAKE ERROR] ========================================" << std::endl;
-        std::cerr << "[HANDSHAKE ERROR] Troubleshooting Information:" << std::endl;
-        std::cerr << "[HANDSHAKE ERROR]   - User: " << user << std::endl;
-        std::cerr << "[HANDSHAKE ERROR]   - Host: " << host << std::endl;
-        std::cerr << "[HANDSHAKE ERROR]   - Auth Plugin: " << auth_plugin_name << std::endl;
-        std::cerr << "[HANDSHAKE ERROR]   - Scramble Buffer Size: " << scramble_buffer_.size() << " bytes" << std::endl;
-        std::cerr << "[HANDSHAKE ERROR]   - Token Size: " << token.size() << " bytes" << std::endl;
-        std::cerr << "[HANDSHAKE ERROR] ========================================" << std::endl;
+        return true;
+    };
 
+    Packet auth_resp;
+
+    auto read_next_auth = [&](const char *context) -> bool {
+        if (!read_packet(auth_resp) || auth_resp.payload.empty()) {
+            std::cerr << "[HANDSHAKE ERROR] Failed to read authentication response packet from server" << std::endl;
+            return false;
+        }
+
+        // Align client sequence with the next expected packet after the
+        // server response we just consumed.
+        sequence_ = static_cast<uint8_t>(auth_resp.sequence + 1);
+
+        std::cerr << "[HANDSHAKE] Received authentication response (" << context << "), size: "
+                  << auth_resp.payload.size() << " bytes" << std::endl;
+        dump_hex("[HANDSHAKE] Auth response packet", auth_resp.payload.data(), auth_resp.payload.size());
+
+        return fail_with_packet(auth_resp);
+    };
+
+    if (!read_next_auth("initial")) return false;
+
+    auto send_additional_auth = [&](const std::vector<uint8_t> &payload) -> bool {
+        // Follow-up authentication responses (auth switch, auth more data, RSA
+        // key requests) are raw plugin data with no length prefix; the packet
+        // length field already frames the payload for the server. Adding a
+        // length prefix here causes the server to misinterpret the data and
+        // report out-of-order packets.
+        if (!write_packet(payload)) {
+            std::cerr << "[HANDSHAKE ERROR] Failed to send additional authentication data" << std::endl;
+            return false;
+        }
+        return read_next_auth("follow-up");
+    };
+
+    auto encrypt_and_send_password = [&](const std::string &pubkey) -> bool {
+        std::string key = pubkey;
+        if (!key.empty() && key.back() == '\0') key.pop_back();
+
+        BIO *bio = BIO_new_mem_buf(key.data(), static_cast<int>(key.size()));
+        if (!bio) return false;
+        RSA *rsa = PEM_read_bio_RSA_PUBKEY(bio, nullptr, nullptr, nullptr);
+        BIO_free(bio);
+        if (!rsa) return false;
+
+        if (scramble_buffer_.empty()) return false;
+
+        std::vector<uint8_t> plain(password.begin(), password.end());
+        plain.push_back(0);
+        for (size_t i = 0; i < plain.size(); ++i) plain[i] ^= scramble_buffer_[i % scramble_buffer_.size()];
+
+        std::vector<uint8_t> encrypted(RSA_size(rsa));
+        int enc_size = RSA_public_encrypt(static_cast<int>(plain.size()), plain.data(), encrypted.data(), rsa,
+                                          RSA_PKCS1_OAEP_PADDING);
+        RSA_free(rsa);
+        if (enc_size <= 0) return false;
+        encrypted.resize(static_cast<size_t>(enc_size));
+
+        return send_additional_auth(encrypted);
+    };
+
+    while (true) {
+        // Handle authentication method negotiation.
+        if (auth_resp.payload[0] == 0xfe) {
+            std::cerr << "[HANDSHAKE] Authentication requires additional data (AuthSwitchRequest or AuthMoreData)" << std::endl;
+            const uint8_t *p = auth_resp.payload.data() + 1;
+            const uint8_t *end = auth_resp.payload.data() + auth_resp.payload.size();
+            const uint8_t *name_end = std::find(p, end, static_cast<uint8_t>(0));
+            size_t name_len = static_cast<size_t>((name_end == end ? end : name_end) - p);
+            auth_plugin_name.assign(reinterpret_cast<const char*>(p), name_len);
+
+            if (name_end == end) {
+                std::cerr << "[HANDSHAKE WARNING] Auth switch request missing plugin terminator; using remaining payload" << std::endl;
+                p = end;
+            } else {
+                p = name_end + 1; // consume null terminator
+            }
+
+            scramble_buffer_.assign(p, end);
+            if (!scramble_buffer_.empty() && scramble_buffer_.back() == 0x00) {
+                scramble_buffer_.pop_back();
+            }
+            if (scramble_buffer_.size() > 20) {
+                scramble_buffer_.resize(20);
+            }
+            std::cerr << "[HANDSHAKE] Switched auth plugin to: " << auth_plugin_name << std::endl;
+            dump_hex("[HANDSHAKE] New scramble buffer", scramble_buffer_.data(), scramble_buffer_.size());
+
+            if (auth_plugin_name == "mysql_native_password") {
+                token = scramble_native_password(password, scramble_buffer_);
+            } else {
+                token = scramble_caching_sha2_password(password, scramble_buffer_);
+            }
+
+            if (!send_additional_auth(token)) return false;
+            continue;
+        }
+
+        if (auth_resp.payload[0] == 0x01 && auth_plugin_name == "caching_sha2_password") {
+            if (auth_resp.payload.size() < 2) {
+                std::cerr << "[HANDSHAKE ERROR] AuthMoreData packet too short" << std::endl;
+                return false;
+            }
+
+            uint8_t status = auth_resp.payload[1];
+            if (status == 0x03) {
+                std::cerr << "[HANDSHAKE] caching_sha2_password fast authentication accepted" << std::endl;
+                if (!read_next_auth("post-fast-auth")) return false;
+                continue;
+            }
+
+            if (status == 0x04) {
+                std::cerr << "[HANDSHAKE] caching_sha2_password requires full authentication" << std::endl;
+
+                if (ssl_active_) {
+                    std::vector<uint8_t> plain(password.begin(), password.end());
+                    plain.push_back(0);
+                    if (!send_additional_auth(plain)) return false;
+                    continue;
+                }
+
+                // Non-TLS: fetch or use provided RSA public key, then send encrypted password.
+                if (auth_resp.payload.size() > 2) {
+                    // Inline RSA public key follows the status byte.
+                    std::string pubkey(reinterpret_cast<const char*>(auth_resp.payload.data() + 2),
+                                       auth_resp.payload.size() - 2);
+                    if (!encrypt_and_send_password(pubkey)) return false;
+                } else {
+                    std::cerr << "[HANDSHAKE] Requesting RSA public key (no TLS)" << std::endl;
+                    if (!send_additional_auth({0x02})) return false; // Request public key
+                    if (auth_resp.payload.empty() || auth_resp.payload[0] != 0x01) {
+                        std::cerr << "[HANDSHAKE ERROR] Server did not return RSA public key" << std::endl;
+                        return false;
+                    }
+                    std::string pubkey(reinterpret_cast<const char*>(auth_resp.payload.data() + 1),
+                                       auth_resp.payload.size() - 1);
+                    if (!encrypt_and_send_password(pubkey)) return false;
+                }
+                continue;
+            }
+
+            if (status == 0x02) {
+                std::cerr << "[HANDSHAKE] caching_sha2_password provided RSA public key inline" << std::endl;
+                // Inline key is after the status byte.
+                std::string pubkey(reinterpret_cast<const char*>(auth_resp.payload.data() + 2), auth_resp.payload.size() - 2);
+                if (!encrypt_and_send_password(pubkey)) return false;
+                continue;
+            }
+
+            std::cerr << "[HANDSHAKE ERROR] Unsupported caching_sha2_password status byte: 0x" << std::hex
+                      << static_cast<int>(status) << std::dec << std::endl;
+            return false;
+        }
+
+        if (auth_resp.payload[0] == 0x00) {
+            std::cerr << "[HANDSHAKE] Authentication successful! (OK packet received)" << std::endl;
+            sequence_ = 0; // reset for subsequent commands
+            return true;
+        }
+
+        std::cerr << "[HANDSHAKE] Unexpected response packet type: 0x" << std::hex
+                  << static_cast<int>(auth_resp.payload[0]) << std::dec << std::endl;
         return false;
     }
-
-    if (auth_resp.payload[0] == 0x00) {
-        std::cerr << "[HANDSHAKE] Authentication successful! (OK packet received)" << std::endl;
-    } else if (auth_resp.payload[0] == 0xfe) {
-        std::cerr << "[HANDSHAKE] Authentication requires additional data (AuthSwitchRequest or AuthMoreData)" << std::endl;
-    } else {
-        std::cerr << "[HANDSHAKE] Unexpected response packet type: 0x" << std::hex << static_cast<int>(auth_resp.payload[0]) << std::dec << std::endl;
-    }
-
-    return true;
 }
 
 bool MySQLConnection::send_command(uint8_t command, const std::vector<uint8_t> &data) {
