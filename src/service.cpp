@@ -109,16 +109,23 @@ int run_replicapulse(const ReplicaPulseConfig &config_in, const SqlSink &sink, s
     auto connect_stream = [&]() {
         std::lock_guard<std::mutex> lk(ctx.pos_mutex);
         std::string resume_gtids = ctx.gtid_tracker.executed_string();
+        bool connected = false;
         if (!resume_gtids.empty()) {
-            return stream_conn.connect_gtid(config.host, config.port, config.user, config.password, config.server_id,
+            connected = stream_conn.connect_gtid(config.host, config.port, config.user, config.password, config.server_id,
                                             ctx.current_binlog, ctx.current_pos.load(), resume_gtids);
-        }
-        if (config.start_gtid_set) {
-            return stream_conn.connect_gtid(config.host, config.port, config.user, config.password, config.server_id,
+        } else if (config.start_gtid_set) {
+            connected = stream_conn.connect_gtid(config.host, config.port, config.user, config.password, config.server_id,
                                             ctx.current_binlog, ctx.current_pos.load(), *config.start_gtid_set);
-        }
-        return stream_conn.connect(config.host, config.port, config.user, config.password, config.server_id,
+        } else {
+            connected = stream_conn.connect(config.host, config.port, config.user, config.password, config.server_id,
                                    ctx.current_binlog, ctx.current_pos.load());
+        }
+        if (connected) {
+            // Use a much longer timeout for binlog streaming (5 minutes)
+            // since events may arrive infrequently
+            stream_conn.set_timeout_ms(300000);
+        }
+        return connected;
     };
 
     BoundedQueue<BinlogPacket> decode_queue(config.decode_queue_size);
