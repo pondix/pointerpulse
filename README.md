@@ -46,6 +46,16 @@ sink.callback = [&](const std::string &sql) { /* forward to your queue/logger */
 int rc = replicapulse::run_replicapulse(cfg, sink, stop);
 ```
 
+### Command-line options
+Run `replicapulse --help` to see the complete list of supported flags. Key options include:
+
+- Connection: `--host`, `--port`, `--user`, `--password`, `--server-id`
+- Start position: `--start-binlog` + `--start-pos`, or `--start-gtid` to begin from a GTID set
+- Output: `--output -` (stdout) or a filepath, queue sizes (`--decode-queue-size`, `--work-queue-size`), and worker pool size (`--threads`)
+- Checkpointing and HA: `--checkpoint-file`, `--ha-lease-file`, `--ha-node-id`, `--ha-timeout`
+- Formatting toggles: `--include-gtid`/`--no-gtid` and `--include-binlog-coords`/`--no-binlog-coords`
+- Networking: TLS (`--ssl`) plus IO/reconnect tuning (`--io-timeout-ms`, `--reconnect-delay-ms`, `--reconnect-delay-max-ms`)
+
 ### Docker Compose demo
 A reproducible integration harness lives in `docker-compose.yml`. It boots MySQL with binlog enabled, runs a DDL/DML workload, and stores ReplicaPulse output in `docker/demo/output/output.sql`.
 ```bash
