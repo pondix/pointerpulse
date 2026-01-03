@@ -647,6 +647,9 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
         // Align client sequence with the next expected packet after the
         // server response we just consumed.
         sequence_ = static_cast<uint8_t>(auth_resp.sequence + 1);
+        (void)context;
+        return true;
+    };
 
     dump_hex("[HANDSHAKE] Auth response packet", auth_resp.payload.data(), auth_resp.payload.size());
     std::cerr << "[HANDSHAKE] Response packet type: 0x" << std::hex << static_cast<int>(auth_resp.payload[0]) << std::dec << std::endl;
