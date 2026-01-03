@@ -582,6 +582,12 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
 
     std::cerr << "[HANDSHAKE] Waiting for authentication response from server..." << std::endl;
 
+    auto read_auth_packet = [this](Packet &pkt) -> bool {
+        if (!read_packet(pkt)) return false;
+        if (pkt.payload.empty()) return false;
+        return true;
+    };
+
     auto fail_with_packet = [&](const Packet &auth_resp) {
         std::cerr << "[HANDSHAKE] Response packet type: 0x" << std::hex
                   << static_cast<int>(auth_resp.payload[0]) << std::dec << std::endl;
@@ -627,6 +633,10 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
     };
 
     Packet auth_resp;
+    if (!read_auth_packet(auth_resp)) {
+        std::cerr << "[HANDSHAKE ERROR] Failed to read authentication response packet from server" << std::endl;
+        return false;
+    }
 
     auto read_next_auth = [&](const char *context) -> bool {
         if (!read_packet(auth_resp) || auth_resp.payload.empty()) {
@@ -638,157 +648,108 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
         // server response we just consumed.
         sequence_ = static_cast<uint8_t>(auth_resp.sequence + 1);
 
-        std::cerr << "[HANDSHAKE] Received authentication response (" << context << "), size: "
-                  << auth_resp.payload.size() << " bytes" << std::endl;
-        dump_hex("[HANDSHAKE] Auth response packet", auth_resp.payload.data(), auth_resp.payload.size());
+    dump_hex("[HANDSHAKE] Auth response packet", auth_resp.payload.data(), auth_resp.payload.size());
+    std::cerr << "[HANDSHAKE] Response packet type: 0x" << std::hex << static_cast<int>(auth_resp.payload[0]) << std::dec << std::endl;
 
-        return fail_with_packet(auth_resp);
-    };
+    if (!fail_with_packet(auth_resp)) return false;
 
-    if (!read_next_auth("initial")) return false;
+    if (auth_resp.payload[0] == 0xff) {
+        // Error packet - extract detailed error information
+        return false;
+    }
 
     auto send_additional_auth = [&](const std::vector<uint8_t> &payload) -> bool {
-        // Follow-up authentication responses (auth switch, auth more data, RSA
-        // key requests) are raw plugin data with no length prefix; the packet
-        // length field already frames the payload for the server. Adding a
-        // length prefix here causes the server to misinterpret the data and
-        // report out-of-order packets.
         if (!write_packet(payload)) {
             std::cerr << "[HANDSHAKE ERROR] Failed to send additional authentication data" << std::endl;
             return false;
         }
-        return read_next_auth("follow-up");
-    };
-
-    auto encrypt_and_send_password = [&](const std::string &pubkey) -> bool {
-        std::string key = pubkey;
-        if (!key.empty() && key.back() == '\0') key.pop_back();
-
-        BIO *bio = BIO_new_mem_buf(key.data(), static_cast<int>(key.size()));
-        if (!bio) return false;
-        RSA *rsa = PEM_read_bio_RSA_PUBKEY(bio, nullptr, nullptr, nullptr);
-        BIO_free(bio);
-        if (!rsa) return false;
-
-        if (scramble_buffer_.empty()) return false;
-
-        std::vector<uint8_t> plain(password.begin(), password.end());
-        plain.push_back(0);
-        for (size_t i = 0; i < plain.size(); ++i) plain[i] ^= scramble_buffer_[i % scramble_buffer_.size()];
-
-        std::vector<uint8_t> encrypted(RSA_size(rsa));
-        int enc_size = RSA_public_encrypt(static_cast<int>(plain.size()), plain.data(), encrypted.data(), rsa,
-                                          RSA_PKCS1_OAEP_PADDING);
-        RSA_free(rsa);
-        if (enc_size <= 0) return false;
-        encrypted.resize(static_cast<size_t>(enc_size));
-
-        return send_additional_auth(encrypted);
-    };
-
-    while (true) {
-        // Handle authentication method negotiation.
-        if (auth_resp.payload[0] == 0xfe) {
-            std::cerr << "[HANDSHAKE] Authentication requires additional data (AuthSwitchRequest or AuthMoreData)" << std::endl;
-            const uint8_t *p = auth_resp.payload.data() + 1;
-            const uint8_t *end = auth_resp.payload.data() + auth_resp.payload.size();
-            const uint8_t *name_end = std::find(p, end, static_cast<uint8_t>(0));
-            size_t name_len = static_cast<size_t>((name_end == end ? end : name_end) - p);
-            auth_plugin_name.assign(reinterpret_cast<const char*>(p), name_len);
-
-            if (name_end == end) {
-                std::cerr << "[HANDSHAKE WARNING] Auth switch request missing plugin terminator; using remaining payload" << std::endl;
-                p = end;
-            } else {
-                p = name_end + 1; // consume null terminator
-            }
-
-            scramble_buffer_.assign(p, end);
-            if (!scramble_buffer_.empty() && scramble_buffer_.back() == 0x00) {
-                scramble_buffer_.pop_back();
-            }
-            if (scramble_buffer_.size() > 20) {
-                scramble_buffer_.resize(20);
-            }
-            std::cerr << "[HANDSHAKE] Switched auth plugin to: " << auth_plugin_name << std::endl;
-            dump_hex("[HANDSHAKE] New scramble buffer", scramble_buffer_.data(), scramble_buffer_.size());
-
-            if (auth_plugin_name == "mysql_native_password") {
-                token = scramble_native_password(password, scramble_buffer_);
-            } else {
-                token = scramble_caching_sha2_password(password, scramble_buffer_);
-            }
-
-            if (!send_additional_auth(token)) return false;
-            continue;
-        }
-
-        if (auth_resp.payload[0] == 0x01 && auth_plugin_name == "caching_sha2_password") {
-            if (auth_resp.payload.size() < 2) {
-                std::cerr << "[HANDSHAKE ERROR] AuthMoreData packet too short" << std::endl;
-                return false;
-            }
-
-            uint8_t status = auth_resp.payload[1];
-            if (status == 0x03) {
-                std::cerr << "[HANDSHAKE] caching_sha2_password fast authentication accepted" << std::endl;
-                if (!read_next_auth("post-fast-auth")) return false;
-                continue;
-            }
-
-            if (status == 0x04) {
-                std::cerr << "[HANDSHAKE] caching_sha2_password requires full authentication" << std::endl;
-
-                if (ssl_active_) {
-                    std::vector<uint8_t> plain(password.begin(), password.end());
-                    plain.push_back(0);
-                    if (!send_additional_auth(plain)) return false;
-                    continue;
-                }
-
-                // Non-TLS: fetch or use provided RSA public key, then send encrypted password.
-                if (auth_resp.payload.size() > 2) {
-                    // Inline RSA public key follows the status byte.
-                    std::string pubkey(reinterpret_cast<const char*>(auth_resp.payload.data() + 2),
-                                       auth_resp.payload.size() - 2);
-                    if (!encrypt_and_send_password(pubkey)) return false;
-                } else {
-                    std::cerr << "[HANDSHAKE] Requesting RSA public key (no TLS)" << std::endl;
-                    if (!send_additional_auth({0x02})) return false; // Request public key
-                    if (auth_resp.payload.empty() || auth_resp.payload[0] != 0x01) {
-                        std::cerr << "[HANDSHAKE ERROR] Server did not return RSA public key" << std::endl;
-                        return false;
-                    }
-                    std::string pubkey(reinterpret_cast<const char*>(auth_resp.payload.data() + 1),
-                                       auth_resp.payload.size() - 1);
-                    if (!encrypt_and_send_password(pubkey)) return false;
-                }
-                continue;
-            }
-
-            if (status == 0x02) {
-                std::cerr << "[HANDSHAKE] caching_sha2_password provided RSA public key inline" << std::endl;
-                // Inline key is after the status byte.
-                std::string pubkey(reinterpret_cast<const char*>(auth_resp.payload.data() + 2), auth_resp.payload.size() - 2);
-                if (!encrypt_and_send_password(pubkey)) return false;
-                continue;
-            }
-
-            std::cerr << "[HANDSHAKE ERROR] Unsupported caching_sha2_password status byte: 0x" << std::hex
-                      << static_cast<int>(status) << std::dec << std::endl;
+        if (!read_auth_packet(auth_resp)) {
+            std::cerr << "[HANDSHAKE ERROR] Failed to read follow-up authentication response" << std::endl;
             return false;
         }
+        dump_hex("[HANDSHAKE] Auth response packet", auth_resp.payload.data(), auth_resp.payload.size());
+        std::cerr << "[HANDSHAKE] Response packet type: 0x" << std::hex << static_cast<int>(auth_resp.payload[0]) << std::dec << std::endl;
+        if (!fail_with_packet(auth_resp)) return false;
+        return true;
+    };
 
-        if (auth_resp.payload[0] == 0x00) {
-            std::cerr << "[HANDSHAKE] Authentication successful! (OK packet received)" << std::endl;
-            sequence_ = 0; // reset for subsequent commands
-            return true;
+    // Handle authentication method negotiation.
+    if (auth_resp.payload[0] == 0xfe) {
+        std::cerr << "[HANDSHAKE] Authentication requires additional data (AuthSwitchRequest or AuthMoreData)" << std::endl;
+        const uint8_t *p = auth_resp.payload.data() + 1;
+        const uint8_t *end = auth_resp.payload.data() + auth_resp.payload.size();
+        auth_plugin_name.assign(reinterpret_cast<const char*>(p));
+        p += auth_plugin_name.size() + 1; // consume name + null terminator
+        scramble_buffer_.assign(p, end);
+        std::cerr << "[HANDSHAKE] Switched auth plugin to: " << auth_plugin_name << std::endl;
+        dump_hex("[HANDSHAKE] New scramble buffer", scramble_buffer_.data(), scramble_buffer_.size());
+
+        if (auth_plugin_name == "mysql_native_password") {
+            token = scramble_native_password(password, scramble_buffer_);
+        } else {
+            token = scramble_caching_sha2_password(password, scramble_buffer_);
         }
 
-        std::cerr << "[HANDSHAKE] Unexpected response packet type: 0x" << std::hex
-                  << static_cast<int>(auth_resp.payload[0]) << std::dec << std::endl;
-        return false;
+        if (!send_additional_auth(token)) return false;
     }
+
+    if (auth_resp.payload[0] == 0x01 && auth_plugin_name == "caching_sha2_password") {
+        uint8_t status = auth_resp.payload.size() > 1 ? auth_resp.payload[1] : 0;
+        if (status == 0x03) {
+            std::cerr << "[HANDSHAKE] caching_sha2_password fast authentication accepted" << std::endl;
+            if (!read_auth_packet(auth_resp)) {
+                std::cerr << "[HANDSHAKE ERROR] Failed to read OK packet after fast authentication" << std::endl;
+                return false;
+            }
+            std::cerr << "[HANDSHAKE] Response packet type: 0x" << std::hex << static_cast<int>(auth_resp.payload[0]) << std::dec << std::endl;
+            if (!fail_with_packet(auth_resp)) return false;
+        } else if (status == 0x04) {
+            std::cerr << "[HANDSHAKE] caching_sha2_password requires full authentication" << std::endl;
+
+            if (ssl_active_) {
+                std::vector<uint8_t> plain(password.begin(), password.end());
+                plain.push_back(0);
+                if (!send_additional_auth(plain)) return false;
+            } else {
+                std::cerr << "[HANDSHAKE] Requesting RSA public key (no TLS)" << std::endl;
+                if (!send_additional_auth({0x02})) return false; // Request public key
+                if (auth_resp.payload.empty() || auth_resp.payload[0] != 0x01) {
+                    std::cerr << "[HANDSHAKE ERROR] Server did not return RSA public key" << std::endl;
+                    return false;
+                }
+
+                std::string pubkey(reinterpret_cast<const char*>(auth_resp.payload.data() + 1), auth_resp.payload.size() - 1);
+                if (!pubkey.empty() && pubkey.back() == '\0') pubkey.pop_back();
+
+                BIO *bio = BIO_new_mem_buf(pubkey.data(), static_cast<int>(pubkey.size()));
+                if (!bio) return false;
+                RSA *rsa = PEM_read_bio_RSA_PUBKEY(bio, nullptr, nullptr, nullptr);
+                BIO_free(bio);
+                if (!rsa) return false;
+
+                std::vector<uint8_t> plain(password.begin(), password.end());
+                plain.push_back(0);
+                for (size_t i = 0; i < plain.size(); ++i) plain[i] ^= scramble_buffer_[i % scramble_buffer_.size()];
+
+                std::vector<uint8_t> encrypted(RSA_size(rsa));
+                int enc_size = RSA_public_encrypt(static_cast<int>(plain.size()), plain.data(), encrypted.data(), rsa,
+                                                  RSA_PKCS1_OAEP_PADDING);
+                RSA_free(rsa);
+                if (enc_size <= 0) return false;
+                encrypted.resize(static_cast<size_t>(enc_size));
+
+                if (!send_additional_auth(encrypted)) return false;
+            }
+        }
+    }
+
+    if (auth_resp.payload[0] == 0x00) {
+        std::cerr << "[HANDSHAKE] Authentication successful! (OK packet received)" << std::endl;
+        return true;
+    }
+
+    std::cerr << "[HANDSHAKE] Unexpected response packet type: 0x" << std::hex << static_cast<int>(auth_resp.payload[0]) << std::dec << std::endl;
+    return false;
 }
 
 bool MySQLConnection::send_command(uint8_t command, const std::vector<uint8_t> &data) {
