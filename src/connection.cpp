@@ -25,6 +25,7 @@ constexpr uint32_t CLIENT_CONNECT_WITH_DB = 1u << 3;
 constexpr uint32_t CLIENT_PROTOCOL_41 = 1u << 9;
 constexpr uint32_t CLIENT_SECURE_CONNECTION = 1u << 15;
 constexpr uint32_t CLIENT_MULTI_RESULTS = 1u << 17;
+constexpr uint32_t CLIENT_SESSION_TRACK = 1u << 23;
 constexpr uint32_t CLIENT_PLUGIN_AUTH = 1u << 19;
 constexpr uint32_t CLIENT_DEPRECATE_EOF = 1u << 24;
 constexpr uint32_t CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA = 1u << 21;
@@ -32,6 +33,7 @@ constexpr uint32_t CLIENT_SSL = 1u << 11;
 constexpr uint8_t COM_QUERY = 0x03;
 constexpr uint8_t COM_BINLOG_DUMP = 0x12;
 constexpr uint8_t COM_BINLOG_DUMP_GTID = 0x1e;
+constexpr uint16_t SERVER_SESSION_STATE_CHANGED = 1u << 14;
 
 void dump_hex(const std::string &label, const uint8_t* data, size_t len) {
     std::cerr << label << " (" << len << " bytes): ";
@@ -97,26 +99,34 @@ std::vector<uint8_t> scramble_caching_sha2_password(const std::string &password,
     return token;
 }
 
-uint64_t read_lenenc_int(const uint8_t *&p, const uint8_t *end) {
+uint64_t read_lenenc_int(const uint8_t *&p, const uint8_t *end, bool *is_null = nullptr) {
+    if (is_null) *is_null = false;
     if (p >= end) return 0;
     uint8_t first = *p++;
     if (first < 0xfb) return first;
-    if (first == 0xfc && p + 2 <= end) {
+    if (first == 0xfb) {
+        if (is_null) *is_null = true;
+        return 0;
+    }
+    auto has_bytes = [&](size_t needed) { return static_cast<size_t>(end - p) >= needed; };
+    if (first == 0xfc && has_bytes(2)) {
         uint64_t v = p[0] | (p[1] << 8);
         p += 2;
         return v;
     }
-    if (first == 0xfd && p + 3 <= end) {
+    if (first == 0xfd && has_bytes(3)) {
         uint64_t v = p[0] | (p[1] << 8) | (p[2] << 16);
         p += 3;
         return v;
     }
-    if (first == 0xfe && p + 8 <= end) {
+    if (first == 0xfe && has_bytes(8)) {
         uint64_t v = 0;
         for (int i = 0; i < 8; ++i) v |= (static_cast<uint64_t>(p[i]) << (8 * i));
         p += 8;
         return v;
     }
+    // Malformed length-encoded integer; clamp to available bytes.
+    p = end;
     return 0;
 }
 
@@ -141,7 +151,9 @@ void write_lenenc_int(std::vector<uint8_t> &out, uint64_t value) {
 }
 
 std::string read_lenenc_string(const uint8_t *&p, const uint8_t *end) {
-    uint64_t len = read_lenenc_int(p, end);
+    bool is_null = false;
+    uint64_t len = read_lenenc_int(p, end, &is_null);
+    if (is_null) return std::string();
     if (p + len > end) len = end - p;
     std::string s(reinterpret_cast<const char *>(p), len);
     p += len;
@@ -153,11 +165,96 @@ bool is_eof_packet(const Packet &packet) {
     return packet.payload[0] == 0xfe && packet.payload.size() < 9;
 }
 
+bool is_ok_packet(const Packet &packet, uint32_t capability_flags) {
+    if (packet.payload.empty() || packet.payload[0] != 0x00) return false;
+
+    auto parse_lenenc_int = [&](const uint8_t *&p, const uint8_t *end, uint64_t &value, bool &is_null) -> bool {
+        if (p >= end) return false;
+        uint8_t first = *p++;
+        is_null = false;
+        if (first < 0xfb) {
+            value = first;
+            return true;
+        }
+        if (first == 0xfb) {
+            value = 0;
+            is_null = true;
+            return true;
+        }
+        auto has_bytes = [&](size_t needed) { return static_cast<size_t>(end - p) >= needed; };
+        if (first == 0xfc && has_bytes(2)) {
+            value = p[0] | (static_cast<uint64_t>(p[1]) << 8);
+            p += 2;
+            return true;
+        }
+        if (first == 0xfd && has_bytes(3)) {
+            value = p[0] | (static_cast<uint64_t>(p[1]) << 8) | (static_cast<uint64_t>(p[2]) << 16);
+            p += 3;
+            return true;
+        }
+        if (first == 0xfe && has_bytes(8)) {
+            value = 0;
+            for (int i = 0; i < 8; ++i) value |= (static_cast<uint64_t>(p[i]) << (8 * i));
+            p += 8;
+            return true;
+        }
+        return false;
+    };
+
+    auto consume_lenenc_string = [&](const uint8_t *&p, const uint8_t *end) -> bool {
+        uint64_t len = 0;
+        bool is_null = false;
+        if (!parse_lenenc_int(p, end, len, is_null)) return false;
+        if (is_null) return true;
+        if (len > static_cast<uint64_t>(end - p)) return false;
+        p += len;
+        return true;
+    };
+
+    // Validate the OK packet layout rather than relying on a minimum length
+    // heuristic so that row payloads beginning with 0x00 are not mistaken for
+    // OK terminators. The layout differs slightly depending on whether the
+    // client negotiated CLIENT_PROTOCOL_41.
+    const uint8_t *p = packet.payload.data() + 1;
+    const uint8_t *end = packet.payload.data() + packet.payload.size();
+
+    // affected_rows
+    uint64_t affected_rows = 0;
+    bool is_null = false;
+    if (!parse_lenenc_int(p, end, affected_rows, is_null)) return false;
+    // last_insert_id
+    uint64_t last_insert_id = 0;
+    if (!parse_lenenc_int(p, end, last_insert_id, is_null)) return false;
+
+    uint16_t status_flags = 0;
+    if (capability_flags & CLIENT_PROTOCOL_41) {
+        if (static_cast<size_t>(end - p) < 4) return false;
+        status_flags = read_uint2(p);
+        p += 4; // status_flags + warnings
+    } else {
+        if (static_cast<size_t>(end - p) < 2) return false;
+        status_flags = read_uint2(p);
+        p += 2; // status_flags
+    }
+
+    if (capability_flags & CLIENT_SESSION_TRACK) {
+        if (!consume_lenenc_string(p, end)) return false; // info
+        if (status_flags & SERVER_SESSION_STATE_CHANGED) {
+            if (!consume_lenenc_string(p, end)) return false; // session state info
+        }
+    }
+
+    // Remaining bytes (if any) belong to the info string/session state and
+    // don't need validation for classification purposes.
+    return true;
+}
+
 } // namespace
 
 MySQLConnection::~MySQLConnection() { close(); }
 
 void MySQLConnection::close() {
+    capability_flags_ = 0;
     if (ssl_handle_) {
         SSL_shutdown(ssl_handle_);
         SSL_free(ssl_handle_);
@@ -490,8 +587,13 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
     }
 
     uint32_t desired = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_LONG_PASSWORD | CLIENT_LONG_FLAG |
-                       CLIENT_MULTI_RESULTS | CLIENT_DEPRECATE_EOF;
+                       CLIENT_MULTI_RESULTS | CLIENT_DEPRECATE_EOF | CLIENT_SESSION_TRACK;
     uint32_t server_capability = capability_flags1 | (static_cast<uint32_t>(capability_flags2) << 16);
+
+    if ((server_capability & CLIENT_PROTOCOL_41) == 0) {
+        std::cerr << "[HANDSHAKE ERROR] Server does not support Protocol 4.1; aborting because the client requires it" << std::endl;
+        return false;
+    }
 
     std::cerr << "[HANDSHAKE] Desired client capabilities: 0x" << std::hex << desired << std::dec << std::endl;
 
@@ -509,6 +611,7 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
     }
 
     uint32_t capability = desired & server_capability;
+    capability_flags_ = capability;
     std::cerr << "[HANDSHAKE] Final negotiated capabilities: 0x" << std::hex << capability << std::dec << std::endl;
 
     // The initial server handshake packet is sequence 0. The next outgoing
@@ -822,13 +925,20 @@ bool MySQLConnection::send_query(const std::string &query, std::vector<std::vect
         std::cerr << "Query error" << std::endl;
         return false;
     }
-    if (resp.payload[0] == 0x00) {
+    if (is_ok_packet(resp, capability_flags_)) {
         return true; // OK packet
     }
 
+    const uint8_t *p = resp.payload.data();
+    const uint8_t *end = p + resp.payload.size();
+    uint64_t column_count = read_lenenc_int(p, end);
+    if (column_count == 0) {
+        std::cerr << "Invalid column count in result set" << std::endl;
+        return false;
+    }
+
     uint8_t seq = resp.sequence;
-    uint8_t column_count = resp.payload[0];
-    for (uint8_t i = 0; i < column_count; ++i) {
+    for (uint64_t i = 0; i < column_count; ++i) {
         Packet coldef;
         if (!read_packet(coldef)) return false;
         seq = coldef.sequence;
@@ -837,15 +947,35 @@ bool MySQLConnection::send_query(const std::string &query, std::vector<std::vect
 
     Packet eof_packet;
     if (!read_packet(eof_packet)) return false;
+    bool ok_as_eof = (capability_flags_ & CLIENT_DEPRECATE_EOF) != 0;
+    if (is_ok_packet(eof_packet, capability_flags_)) {
+        if (!ok_as_eof) {
+            std::cerr << "Unexpected OK packet after column definitions without CLIENT_DEPRECATE_EOF" << std::endl;
+            return false;
+        }
+        // Modern servers (MySQL 8.x) return OK instead of EOF when the client
+        // advertises CLIENT_DEPRECATE_EOF. Treat it as the end of column
+        // definitions and proceed to rows.
+    } else if (!is_eof_packet(eof_packet)) {
+        std::cerr << "Unexpected packet after column definitions (expected EOF/OK)" << std::endl;
+        return false;
+    }
 
     while (true) {
         Packet row_packet;
         if (!read_packet(row_packet)) return false;
         if (is_eof_packet(row_packet)) break;
-        const uint8_t *p = row_packet.payload.data();
-        const uint8_t *end = p + row_packet.payload.size();
+        if (is_ok_packet(row_packet, capability_flags_)) {
+            if (!ok_as_eof) {
+                std::cerr << "Unexpected OK packet while reading rows without CLIENT_DEPRECATE_EOF" << std::endl;
+                return false;
+            }
+            break;
+        }
+        p = row_packet.payload.data();
+        end = p + row_packet.payload.size();
         std::vector<std::string> row;
-        for (uint8_t i = 0; i < column_count; ++i) {
+        for (uint64_t i = 0; i < column_count; ++i) {
             row.push_back(read_lenenc_string(p, end));
         }
         rows.push_back(std::move(row));
