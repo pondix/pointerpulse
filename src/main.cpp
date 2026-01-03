@@ -34,7 +34,8 @@ static void print_usage() {
                  "  --reconnect-delay-ms <ms>    Initial reconnect backoff (default: 500)\n"
                  "  --reconnect-delay-max-ms <ms>Max reconnect backoff (default: 8000)\n"
                  "  --io-timeout-ms <ms>         Socket IO timeout for reads/writes (default: 1000)\n"
-                 "  --ssl                       Enable TLS\n"
+                 "  --ssl                        Enable TLS\n"
+                 "  --debug                      Enable debug logging\n"
                  "  -h, --help                   Show this help" << std::endl;
 }
 
@@ -82,6 +83,7 @@ ParseResult parse_args(int argc, char **argv) {
         else if (arg == "--reconnect-delay-max-ms") cfg.reconnect_delay_max_ms = static_cast<uint32_t>(std::stoul(ensure_value(next(), arg)));
         else if (arg == "--io-timeout-ms") cfg.io_timeout_ms = static_cast<uint32_t>(std::stoul(ensure_value(next(), arg)));
         else if (arg == "--ssl") cfg.use_tls = true;
+        else if (arg == "--debug") cfg.debug = true;
         else if (arg == "--decode-queue-size") cfg.decode_queue_size = static_cast<size_t>(std::stoul(ensure_value(next(), arg)));
         else if (arg == "--work-queue-size") cfg.work_queue_size = static_cast<size_t>(std::stoul(ensure_value(next(), arg)));
         else if (arg == "--include-gtid") cfg.include_gtid = true;
