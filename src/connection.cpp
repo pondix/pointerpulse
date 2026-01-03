@@ -785,11 +785,22 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
     // Handle authentication method negotiation.
     if (auth_resp.payload[0] == 0xfe) {
         std::cerr << "[HANDSHAKE] Authentication requires additional data (AuthSwitchRequest or AuthMoreData)" << std::endl;
+
+        // CRITICAL: Update sequence number after receiving AuthSwitchRequest
+        // The next packet we send must have sequence = server_sequence + 1
+        sequence_ = static_cast<uint8_t>(auth_resp.sequence + 1);
+
         const uint8_t *p = auth_resp.payload.data() + 1;
         const uint8_t *end = auth_resp.payload.data() + auth_resp.payload.size();
         auth_plugin_name.assign(reinterpret_cast<const char*>(p));
         p += auth_plugin_name.size() + 1; // consume name + null terminator
         scramble_buffer_.assign(p, end);
+
+        // Strip trailing null from scramble if present (caching_sha2_password sends 20 bytes + null)
+        if (!scramble_buffer_.empty() && scramble_buffer_.back() == 0x00) {
+            scramble_buffer_.pop_back();
+        }
+
         std::cerr << "[HANDSHAKE] Switched auth plugin to: " << auth_plugin_name << std::endl;
         dump_hex("[HANDSHAKE] New scramble buffer", scramble_buffer_.data(), scramble_buffer_.size());
 
