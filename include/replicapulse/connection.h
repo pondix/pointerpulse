@@ -68,6 +68,8 @@ private:
     bool request_binlog_stream_gtid(uint32_t server_id, const std::string &binlog_file, uint64_t position,
                                     const std::string &gtid_set);
     bool send_command(uint8_t command, const std::vector<uint8_t> &data);
+
+    uint32_t capability_flags_{0};
 };
 
 } // namespace replicapulse
