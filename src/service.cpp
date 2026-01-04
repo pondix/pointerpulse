@@ -139,7 +139,9 @@ int run_replicapulse(const ReplicaPulseConfig &config_in, const SqlSink &sink, s
     std::thread io_thread([&] {
         auto do_reconnect = [&](uint32_t &delay_ms) {
             while (!stop.load()) {
+                std::cerr << "connecting to " << config.host << ":" << config.port << "..." << std::endl;
                 if (connect_stream()) {
+                    std::cerr << "connected, streaming binlog events" << std::endl;
                     return true;
                 }
                 std::cerr << "stream connection failed, retrying in " << delay_ms << "ms" << std::endl;
