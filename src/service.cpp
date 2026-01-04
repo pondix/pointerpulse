@@ -65,6 +65,7 @@ static bool fetch_table_metadata(AppContext &ctx, uint64_t table_id, const Table
 }
 
 int run_replicapulse(const ReplicaPulseConfig &config_in, const SqlSink &sink, std::atomic<bool> &stop) {
+    std::cerr << "replicapulse starting..." << std::endl;
     ReplicaPulseConfig config = config_in;
     CheckpointManager checkpoint_mgr(config.checkpoint_file);
     if (!config.start_position && !config.start_gtid_set) {
@@ -136,15 +137,17 @@ int run_replicapulse(const ReplicaPulseConfig &config_in, const SqlSink &sink, s
     parser.set_table_cache(&ctx.cache);
     SqlFormatter formatter(ctx.cache, config.include_gtid, config.include_binlog_coords);
 
+    std::cerr << "starting replicapulse" << std::endl;
+
     std::thread io_thread([&] {
         auto do_reconnect = [&](uint32_t &delay_ms) {
             while (!stop.load()) {
-                std::cerr << "connecting to " << config.host << ":" << config.port << "..." << std::endl;
+                std::cerr << "connecting to " << config.host << ":" << config.port << "..." << std::flush;
                 if (connect_stream()) {
-                    std::cerr << "connected, streaming binlog events" << std::endl;
+                    std::cerr << " connected" << std::endl;
                     return true;
                 }
-                std::cerr << "stream connection failed, retrying in " << delay_ms << "ms" << std::endl;
+                std::cerr << " failed, retrying in " << delay_ms << "ms" << std::endl;
                 std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
                 delay_ms = std::min(delay_ms * 2, config.reconnect_delay_max_ms);
             }
