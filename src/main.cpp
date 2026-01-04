@@ -1,9 +1,11 @@
 #include "replicapulse/config.h"
+#include "replicapulse/logging.h"
 #include "replicapulse/service.h"
 
 #include <atomic>
 #include <iostream>
 #include <csignal>
+#include <sstream>
 
 using namespace replicapulse;
 
@@ -35,7 +37,15 @@ static void print_usage() {
                  "  --reconnect-delay-max-ms <ms>Max reconnect backoff (default: 8000)\n"
                  "  --io-timeout-ms <ms>         Socket IO timeout for reads/writes (default: 1000)\n"
                  "  --ssl                        Enable TLS\n"
-                 "  --debug                      Enable debug logging\n"
+                 "\n"
+                 "Logging options:\n"
+                 "  -q, --quiet                  Only show errors\n"
+                 "  -v, --verbose                Enable verbose (debug) logging\n"
+                 "  -vv, --trace                 Enable trace logging (very verbose)\n"
+                 "  --log-category <cat>         Enable specific category (can repeat):\n"
+                 "                               service, connection, handshake, binlog,\n"
+                 "                               parser, query, output, checkpoint, all\n"
+                 "\n"
                  "  -h, --help                   Show this help" << std::endl;
 }
 
@@ -45,9 +55,24 @@ struct ParseResult {
     std::string error;
 };
 
+static uint32_t parse_log_category(const std::string& cat) {
+    if (cat == "service")    return static_cast<uint32_t>(LogCategory::SERVICE);
+    if (cat == "connection") return static_cast<uint32_t>(LogCategory::CONNECTION);
+    if (cat == "handshake")  return static_cast<uint32_t>(LogCategory::HANDSHAKE);
+    if (cat == "binlog")     return static_cast<uint32_t>(LogCategory::BINLOG);
+    if (cat == "parser")     return static_cast<uint32_t>(LogCategory::PARSER);
+    if (cat == "query")      return static_cast<uint32_t>(LogCategory::QUERY);
+    if (cat == "output")     return static_cast<uint32_t>(LogCategory::OUTPUT);
+    if (cat == "checkpoint") return static_cast<uint32_t>(LogCategory::CHECKPOINT);
+    if (cat == "all")        return static_cast<uint32_t>(LogCategory::ALL);
+    return 0;
+}
+
 ParseResult parse_args(int argc, char **argv) {
     ParseResult result;
     ReplicaPulseConfig &cfg = result.cfg;
+    bool category_set = false;
+
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         auto next = [&]() -> std::string {
@@ -83,13 +108,29 @@ ParseResult parse_args(int argc, char **argv) {
         else if (arg == "--reconnect-delay-max-ms") cfg.reconnect_delay_max_ms = static_cast<uint32_t>(std::stoul(ensure_value(next(), arg)));
         else if (arg == "--io-timeout-ms") cfg.io_timeout_ms = static_cast<uint32_t>(std::stoul(ensure_value(next(), arg)));
         else if (arg == "--ssl") cfg.use_tls = true;
-        else if (arg == "--debug") cfg.debug = true;
         else if (arg == "--decode-queue-size") cfg.decode_queue_size = static_cast<size_t>(std::stoul(ensure_value(next(), arg)));
         else if (arg == "--work-queue-size") cfg.work_queue_size = static_cast<size_t>(std::stoul(ensure_value(next(), arg)));
         else if (arg == "--include-gtid") cfg.include_gtid = true;
         else if (arg == "--no-gtid") cfg.include_gtid = false;
         else if (arg == "--include-binlog-coords") cfg.include_binlog_coords = true;
         else if (arg == "--no-binlog-coords") cfg.include_binlog_coords = false;
+        // Logging options
+        else if (arg == "-q" || arg == "--quiet") cfg.log_verbosity = LogVerbosity::QUIET;
+        else if (arg == "-v" || arg == "--verbose") cfg.log_verbosity = LogVerbosity::VERBOSE;
+        else if (arg == "-vv" || arg == "--trace") cfg.log_verbosity = LogVerbosity::TRACE;
+        else if (arg == "--log-category") {
+            std::string cat = ensure_value(next(), arg);
+            uint32_t cat_val = parse_log_category(cat);
+            if (cat_val == 0) {
+                result.error = "Unknown log category: " + cat;
+            } else {
+                if (!category_set) {
+                    cfg.log_categories = 0;
+                    category_set = true;
+                }
+                cfg.log_categories |= cat_val;
+            }
+        }
         else if (arg == "--help" || arg == "-h") result.show_help = true;
         else {
             result.error = "Unknown argument: " + arg;
@@ -107,6 +148,29 @@ ParseResult parse_args(int argc, char **argv) {
     return result;
 }
 
+static void configure_logging(const ReplicaPulseConfig& config) {
+    Logger& logger = Logger::instance();
+
+    // Set log level based on verbosity
+    switch (config.log_verbosity) {
+        case LogVerbosity::QUIET:
+            logger.set_level(LogLevel::ERROR);
+            break;
+        case LogVerbosity::NORMAL:
+            logger.set_level(LogLevel::ERROR | LogLevel::WARN | LogLevel::INFO);
+            break;
+        case LogVerbosity::VERBOSE:
+            logger.set_level(LogLevel::ERROR | LogLevel::WARN | LogLevel::INFO | LogLevel::DEBUG);
+            break;
+        case LogVerbosity::TRACE:
+            logger.set_level(LogLevel::ALL);
+            break;
+    }
+
+    // Set categories
+    logger.set_categories(static_cast<LogCategory>(config.log_categories));
+}
+
 int main(int argc, char **argv) {
     ParseResult parsed = parse_args(argc, argv);
     if (parsed.show_help) {
@@ -120,8 +184,23 @@ int main(int argc, char **argv) {
     }
 
     ReplicaPulseConfig config = parsed.cfg;
+
+    // Configure logging before anything else
+    configure_logging(config);
+
+    LOG_INFO(LogCategory::SERVICE) << "replicapulse starting";
+    LOG_INFO(LogCategory::SERVICE) << "host=" << config.host << " port=" << config.port
+                                   << " user=" << config.user << " server_id=" << config.server_id;
+
+    if (config.start_position) {
+        LOG_INFO(LogCategory::SERVICE) << "start position: " << config.start_position->binlog_file
+                                       << ":" << config.start_position->position;
+    }
+    if (config.start_gtid_set) {
+        LOG_INFO(LogCategory::SERVICE) << "start GTID set: " << *config.start_gtid_set;
+    }
     if (!config.start_position && !config.start_gtid_set) {
-        std::cerr << "no start position provided; will attempt checkpoint resume" << std::endl;
+        LOG_INFO(LogCategory::SERVICE) << "no start position provided; will attempt checkpoint resume";
     }
 
     std::atomic<bool> stop{false};
@@ -133,5 +212,9 @@ int main(int argc, char **argv) {
     if (config.output_path == "-") {
         sink.stream = &std::cout;
     }
+
+    LOG_DEBUG(LogCategory::SERVICE) << "output=" << config.output_path
+                                    << " checkpoint=" << config.checkpoint_file;
+
     return run_replicapulse(config, sink, stop);
 }

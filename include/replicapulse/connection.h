@@ -46,7 +46,6 @@ public:
     bool set_timeout_ms(uint32_t timeout_ms);
     void set_default_timeout_ms(uint32_t timeout_ms) { timeout_ms_ = timeout_ms; }
     void set_use_tls(bool use_tls) { use_tls_ = use_tls; }
-    void set_debug(bool debug) { debug_ = debug; }
 
 private:
     int sock_fd_{-1};
@@ -57,7 +56,6 @@ private:
     uint8_t sequence_{0};
     std::vector<uint8_t> scramble_buffer_;
     uint32_t timeout_ms_{1000};
-    bool debug_{false};
 
     bool read_packet(Packet &packet);
     bool write_packet(const std::vector<uint8_t> &payload);

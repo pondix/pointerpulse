@@ -12,6 +12,14 @@ struct StartPosition {
     uint32_t position{4};
 };
 
+// Log verbosity levels
+enum class LogVerbosity {
+    QUIET,    // Only errors
+    NORMAL,   // Errors + warnings + basic info
+    VERBOSE,  // Add debug output
+    TRACE     // Everything including trace
+};
+
 struct ReplicaPulseConfig {
     std::string host{"127.0.0.1"};
     uint16_t port{3306};
@@ -36,7 +44,6 @@ struct ReplicaPulseConfig {
     uint32_t io_timeout_ms{1000};
 
     bool use_tls{false};
-    bool debug{false};
 
     bool include_gtid{true};
     bool include_binlog_coords{true};
@@ -44,6 +51,10 @@ struct ReplicaPulseConfig {
     size_t decode_queue_size{1024};
     size_t work_queue_size{1024};
     size_t worker_threads{4};
+
+    // Logging configuration
+    LogVerbosity log_verbosity{LogVerbosity::NORMAL};
+    uint32_t log_categories{0xFFFFFFFF};  // All categories by default
 };
 
 } // namespace replicapulse
