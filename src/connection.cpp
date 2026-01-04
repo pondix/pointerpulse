@@ -1,4 +1,5 @@
 #include "replicapulse/connection.h"
+#include "replicapulse/logging.h"
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -6,6 +7,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <cerrno>
 #include <openssl/sha.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -35,18 +37,7 @@ constexpr uint8_t COM_BINLOG_DUMP = 0x12;
 constexpr uint8_t COM_BINLOG_DUMP_GTID = 0x1e;
 constexpr uint16_t SERVER_SESSION_STATE_CHANGED = 1u << 14;
 
-void dump_hex(const std::string &label, const uint8_t* data, size_t len, bool debug) {
-    if (!debug) return;
-    std::cerr << label << " (" << len << " bytes): ";
-    for (size_t i = 0; i < len && i < 64; ++i) {
-        char hex[4];
-        snprintf(hex, sizeof(hex), "%02x ", data[i]);
-        std::cerr << hex;
-        if ((i + 1) % 16 == 0 && i + 1 < len) std::cerr << "\n" << std::string(label.length() + 2, ' ');
-    }
-    if (len > 64) std::cerr << "... (truncated)";
-    std::cerr << std::endl;
-}
+// Removed old dump_hex - now using log_hex from logging.h
 
 uint32_t read_uint3(const uint8_t *ptr) { return ptr[0] | (ptr[1] << 8) | (ptr[2] << 16); }
 uint16_t read_uint2(const uint8_t *ptr) { return ptr[0] | (ptr[1] << 8); }
@@ -278,21 +269,31 @@ void MySQLConnection::close() {
 bool MySQLConnection::connect(const std::string &host, uint16_t port, const std::string &user,
                                const std::string &password, uint32_t server_id,
                                const std::string &binlog_file, uint32_t position) {
-    if (!open_socket(host, port)) return false;
+    LOG_INFO(LogCategory::CONNECTION) << "connect() binlog mode: " << host << ":" << port
+                                      << " file=" << binlog_file << " pos=" << position;
+
+    if (!open_socket(host, port)) {
+        LOG_ERROR(LogCategory::CONNECTION) << "open_socket failed";
+        return false;
+    }
 
     set_timeout_ms(timeout_ms_);
 
     if (!handshake(host, user, password)) {
-        std::cerr << "MySQL handshake failed" << std::endl;
+        LOG_ERROR(LogCategory::HANDSHAKE) << "handshake failed";
         close();
         return false;
     }
 
+    LOG_DEBUG(LogCategory::CONNECTION) << "handshake successful, requesting binlog stream";
+
     if (!request_binlog_stream(server_id, binlog_file, position)) {
-        std::cerr << "Failed to request binlog stream" << std::endl;
+        LOG_ERROR(LogCategory::BINLOG) << "request_binlog_stream failed";
         close();
         return false;
     }
+
+    LOG_INFO(LogCategory::BINLOG) << "binlog stream started";
     return true;
 }
 
@@ -300,37 +301,58 @@ bool MySQLConnection::connect_gtid(const std::string &host, uint16_t port, const
                                    const std::string &password, uint32_t server_id,
                                    const std::string &binlog_file, uint64_t position,
                                    const std::string &gtid_set) {
-    if (!open_socket(host, port)) return false;
+    LOG_INFO(LogCategory::CONNECTION) << "connect_gtid() mode: " << host << ":" << port
+                                      << " file=" << binlog_file << " pos=" << position
+                                      << " gtid_set=" << gtid_set;
+
+    if (!open_socket(host, port)) {
+        LOG_ERROR(LogCategory::CONNECTION) << "open_socket failed";
+        return false;
+    }
 
     set_timeout_ms(timeout_ms_);
 
     if (!handshake(host, user, password)) {
-        std::cerr << "MySQL handshake failed" << std::endl;
+        LOG_ERROR(LogCategory::HANDSHAKE) << "handshake failed";
         close();
         return false;
     }
 
+    LOG_DEBUG(LogCategory::CONNECTION) << "handshake successful, requesting GTID binlog stream";
+
     if (!request_binlog_stream_gtid(server_id, binlog_file, position, gtid_set)) {
-        std::cerr << "Failed to request binlog stream (GTID)" << std::endl;
+        LOG_ERROR(LogCategory::BINLOG) << "request_binlog_stream_gtid failed";
         close();
         return false;
     }
+
+    LOG_INFO(LogCategory::BINLOG) << "GTID binlog stream started";
     return true;
 }
 
 bool MySQLConnection::connect_sql(const std::string &host, uint16_t port, const std::string &user,
                                   const std::string &password) {
-    if (!open_socket(host, port)) return false;
+    LOG_INFO(LogCategory::CONNECTION) << "connect_sql() mode: " << host << ":" << port;
+
+    if (!open_socket(host, port)) {
+        LOG_ERROR(LogCategory::CONNECTION) << "open_socket failed";
+        return false;
+    }
 
     set_timeout_ms(timeout_ms_);
+
     if (!handshake(host, user, password)) {
+        LOG_ERROR(LogCategory::HANDSHAKE) << "handshake failed";
         close();
         return false;
     }
+
+    LOG_INFO(LogCategory::CONNECTION) << "SQL connection established";
     return true;
 }
 
 bool MySQLConnection::open_socket(const std::string &host, uint16_t port) {
+    LOG_DEBUG(LogCategory::CONNECTION) << "open_socket: " << host << ":" << port;
     close();
 
     addrinfo hints{};
@@ -342,24 +364,28 @@ bool MySQLConnection::open_socket(const std::string &host, uint16_t port) {
     const std::string port_str = std::to_string(port);
     int rc = ::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &result);
     if (rc != 0) {
-        std::cerr << "Invalid host address: " << ::gai_strerror(rc) << std::endl;
+        LOG_ERROR(LogCategory::CONNECTION) << "getaddrinfo failed: " << ::gai_strerror(rc);
         return false;
     }
 
     for (addrinfo *rp = result; rp != nullptr; rp = rp->ai_next) {
         sock_fd_ = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (sock_fd_ < 0) continue;
+        if (sock_fd_ < 0) {
+            LOG_TRACE(LogCategory::CONNECTION) << "socket() failed, trying next";
+            continue;
+        }
 
         if (::connect(sock_fd_, rp->ai_addr, rp->ai_addrlen) == 0) {
             ::freeaddrinfo(result);
             return true;
         }
 
+        LOG_TRACE(LogCategory::CONNECTION) << "connect() to address failed: " << strerror(errno);
         ::close(sock_fd_);
         sock_fd_ = -1;
     }
 
-    std::perror("connect");
+    LOG_ERROR(LogCategory::CONNECTION) << "failed to connect to any address for " << host << ":" << port;
     ::freeaddrinfo(result);
     return false;
 }
@@ -409,56 +435,58 @@ bool MySQLConnection::ensure_tls(const std::string &host, uint32_t capability_fl
 }
 
 bool MySQLConnection::handshake(const std::string &host, const std::string &user, const std::string &password) {
-    if (debug_) std::cerr << "[HANDSHAKE] Starting MySQL handshake for user '" << user << "' on host '" << host << "'" << std::endl;
+    LOG_INFO(LogCategory::HANDSHAKE) << "starting handshake for user '" << user << "'";
+    LOG_DEBUG(LogCategory::HANDSHAKE) << "host=" << host;
 
     sequence_ = 0;
     Packet packet;
     if (!read_packet(packet)) {
-        std::cerr << "[HANDSHAKE ERROR] Failed to read initial handshake packet from server" << std::endl;
+        LOG_ERROR(LogCategory::HANDSHAKE) << "failed to read initial handshake packet from server";
         return false;
     }
 
-    if (debug_) std::cerr << "[HANDSHAKE] Received initial packet, size: " << packet.payload.size() << " bytes" << std::endl;
+    LOG_DEBUG(LogCategory::HANDSHAKE) << "received initial packet, size=" << packet.payload.size() << " bytes";
+    log_hex(LogLevel::TRACE, LogCategory::HANDSHAKE, "initial packet", packet.payload.data(), packet.payload.size());
 
     const uint8_t *ptr = packet.payload.data();
     const uint8_t *end = ptr + packet.payload.size();
 
     if (ptr >= end) {
-        std::cerr << "[HANDSHAKE ERROR] Initial packet is empty" << std::endl;
+        LOG_ERROR(LogCategory::HANDSHAKE) << "initial packet is empty";
         return false;
     }
 
     uint8_t protocol_version = *ptr++;
-    if (debug_) std::cerr << "[HANDSHAKE] Protocol version: " << static_cast<int>(protocol_version) << std::endl;
+    LOG_DEBUG(LogCategory::HANDSHAKE) << "protocol version: " << static_cast<int>(protocol_version);
 
     const uint8_t *server_ver_end = std::find(ptr, end, static_cast<uint8_t>(0));
     if (server_ver_end == end) {
-        std::cerr << "[HANDSHAKE ERROR] Server version string not null-terminated" << std::endl;
+        LOG_ERROR(LogCategory::HANDSHAKE) << "server version string not null-terminated";
         return false;
     }
     std::string server_version(reinterpret_cast<const char *>(ptr), server_ver_end - ptr);
-    if (debug_) std::cerr << "[HANDSHAKE] Server version: " << server_version << std::endl;
+    LOG_INFO(LogCategory::HANDSHAKE) << "server version: " << server_version;
 
     ptr = server_ver_end + 1;
     if (ptr + 4 > end) {
-        std::cerr << "[HANDSHAKE ERROR] Packet too short for connection ID" << std::endl;
+        LOG_ERROR(LogCategory::HANDSHAKE) << "packet too short for connection ID";
         return false;
     }
 
     uint32_t connection_id = ptr[0] | (ptr[1] << 8) | (ptr[2] << 16) | (ptr[3] << 24);
-    if (debug_) std::cerr << "[HANDSHAKE] Connection ID: " << connection_id << std::endl;
+    LOG_DEBUG(LogCategory::HANDSHAKE) << "connection ID: " << connection_id;
     ptr += 4; // connection id
 
     std::vector<uint8_t> scramble;
     if (ptr + 8 > end) {
-        std::cerr << "[HANDSHAKE ERROR] Packet too short for auth-plugin-data-part-1" << std::endl;
+        LOG_ERROR(LogCategory::HANDSHAKE) << "packet too short for auth-plugin-data-part-1";
         return false;
     }
     scramble.insert(scramble.end(), ptr, ptr + 8);
     ptr += 8; // auth-plugin-data-part-1
     ptr++;    // filler
     if (ptr + 2 > end) {
-        std::cerr << "[HANDSHAKE ERROR] Packet too short for capability flags" << std::endl;
+        LOG_ERROR(LogCategory::HANDSHAKE) << "packet too short for capability flags";
         return false;
     }
     uint16_t capability_flags1 = read_uint2(ptr);
@@ -468,14 +496,14 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
     uint8_t auth_plugin_data_len = 0;
     std::string auth_plugin_name = "mysql_native_password";
     if (ptr + 1 > end) {
-        std::cerr << "[HANDSHAKE ERROR] Packet too short for character set" << std::endl;
+        LOG_ERROR(LogCategory::HANDSHAKE) << "packet too short for character set";
         return false;
     }
     uint8_t character_set = *ptr++;
     (void)character_set; // currently unused
 
     if (ptr + 2 > end) {
-        std::cerr << "[HANDSHAKE ERROR] Packet too short for status flags" << std::endl;
+        LOG_ERROR(LogCategory::HANDSHAKE) << "packet too short for status flags";
         return false;
     }
     uint16_t status_flags = read_uint2(ptr);
@@ -483,23 +511,23 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
     (void)status_flags; // currently unused
 
     if (ptr + 2 > end) {
-        std::cerr << "[HANDSHAKE ERROR] Packet too short for extended capability flags" << std::endl;
+        LOG_ERROR(LogCategory::HANDSHAKE) << "packet too short for extended capability flags";
         return false;
     }
     capability_flags2 = read_uint2(ptr);
     ptr += 2;
     uint32_t server_cap = capability_flags1 | (static_cast<uint32_t>(capability_flags2) << 16);
-    if (debug_) std::cerr << "[HANDSHAKE] Server capabilities: 0x" << std::hex << server_cap << std::dec << std::endl;
+    LOG_DEBUG(LogCategory::HANDSHAKE) << "server capabilities: 0x" << std::hex << server_cap << std::dec;
 
     if (ptr >= end) {
-        std::cerr << "[HANDSHAKE ERROR] Packet too short for auth plugin data length" << std::endl;
+        LOG_ERROR(LogCategory::HANDSHAKE) << "packet too short for auth plugin data length";
         return false;
     }
     auth_plugin_data_len = *ptr++;
-    if (debug_) std::cerr << "[HANDSHAKE] Auth plugin data length: " << static_cast<int>(auth_plugin_data_len) << std::endl;
+    LOG_DEBUG(LogCategory::HANDSHAKE) << "auth plugin data length: " << static_cast<int>(auth_plugin_data_len);
 
     if (ptr + 10 > end) {
-        std::cerr << "[HANDSHAKE ERROR] Packet too short for reserved bytes" << std::endl;
+        LOG_ERROR(LogCategory::HANDSHAKE) << "packet too short for reserved bytes";
         return false;
     }
     ptr += 10; // reserved bytes
@@ -509,7 +537,7 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
         // Servers occasionally emit 0 here even though 20 bytes follow. Fall back
         // to the protocol default (20 bytes of scramble plus null terminator).
         auth_plugin_data_total_len = 21;
-        if (debug_) std::cerr << "[HANDSHAKE WARNING] Auth plugin data length missing/too small; using default 21" << std::endl;
+        LOG_WARN(LogCategory::HANDSHAKE) << "auth plugin data length missing/too small; using default 21";
     }
 
     const uint8_t *plugin_name_start = end;
@@ -523,7 +551,7 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
             plugin_name_terminated = true;
             --scan; // drop terminator
         } else {
-            if (debug_) std::cerr << "[HANDSHAKE WARNING] Auth plugin name missing null terminator; falling back to default" << std::endl;
+            LOG_WARN(LogCategory::HANDSHAKE) << "auth plugin name missing null terminator; falling back to default";
         }
 
         while (scan > ptr && *(scan - 1) != 0x00) {
@@ -536,7 +564,7 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
             auth_plugin_name.assign(reinterpret_cast<const char *>(plugin_name_start), plugin_len);
             if (auth_plugin_name.empty()) {
                 auth_plugin_name = "mysql_native_password";
-                if (debug_) std::cerr << "[HANDSHAKE WARNING] Empty auth plugin name received; using default mysql_native_password" << std::endl;
+                LOG_WARN(LogCategory::HANDSHAKE) << "empty auth plugin name received; using default mysql_native_password";
             }
         } else {
             // No terminator present. Treat the remaining payload as scramble
@@ -553,8 +581,8 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
     if (server_cap & CLIENT_SECURE_CONNECTION) {
         size_t expected_len = std::max<size_t>(13, auth_plugin_data_total_len > 8 ? auth_plugin_data_total_len - 8 : 0);
         if (part2_len < expected_len) {
-            if (debug_) std::cerr << "[HANDSHAKE WARNING] Auth-plugin-data-part-2 truncated; expected at least "
-                      << expected_len << " bytes but only " << part2_len << " available" << std::endl;
+            LOG_WARN(LogCategory::HANDSHAKE) << "auth-plugin-data-part-2 truncated; expected at least "
+                      << expected_len << " bytes but only " << part2_len << " available";
         }
         if (part2_len > 0 && ptr[part2_len - 1] == 0x00) {
             --part2_len; // drop trailing null terminator
@@ -577,18 +605,16 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
     }
     scramble_buffer_ = scramble;
 
-    if (debug_) {
-        std::cerr << "[HANDSHAKE] Auth plugin name: " << auth_plugin_name << std::endl;
-        std::cerr << "[HANDSHAKE] Scramble buffer size: " << scramble_buffer_.size() << " bytes (expected 20)" << std::endl;
-        dump_hex("[HANDSHAKE] Scramble buffer", scramble_buffer_.data(), scramble_buffer_.size(), debug_);
+    LOG_DEBUG(LogCategory::HANDSHAKE) << "auth plugin name: " << auth_plugin_name;
+    LOG_DEBUG(LogCategory::HANDSHAKE) << "scramble buffer size: " << scramble_buffer_.size() << " bytes (expected 20)";
+    log_hex(LogLevel::DEBUG, LogCategory::HANDSHAKE, "scramble buffer", scramble_buffer_.data(), scramble_buffer_.size());
 
-        if (scramble_buffer_.size() != 20) {
-            std::cerr << "[HANDSHAKE WARNING] ========================================" << std::endl;
-            std::cerr << "[HANDSHAKE WARNING] SCRAMBLE BUFFER SIZE IS INCORRECT!" << std::endl;
-            std::cerr << "[HANDSHAKE WARNING] Expected: 20 bytes, Got: " << scramble_buffer_.size() << " bytes" << std::endl;
-            std::cerr << "[HANDSHAKE WARNING] This WILL cause authentication to fail!" << std::endl;
-            std::cerr << "[HANDSHAKE WARNING] ========================================" << std::endl;
-        }
+    if (scramble_buffer_.size() != 20) {
+        LOG_WARN(LogCategory::HANDSHAKE) << "========================================";
+        LOG_WARN(LogCategory::HANDSHAKE) << "SCRAMBLE BUFFER SIZE IS INCORRECT!";
+        LOG_WARN(LogCategory::HANDSHAKE) << "Expected: 20 bytes, Got: " << scramble_buffer_.size() << " bytes";
+        LOG_WARN(LogCategory::HANDSHAKE) << "This WILL cause authentication to fail!";
+        LOG_WARN(LogCategory::HANDSHAKE) << "========================================";
     }
 
     uint32_t desired = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_LONG_PASSWORD | CLIENT_LONG_FLAG |
@@ -596,28 +622,28 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
     uint32_t server_capability = capability_flags1 | (static_cast<uint32_t>(capability_flags2) << 16);
 
     if ((server_capability & CLIENT_PROTOCOL_41) == 0) {
-        std::cerr << "[HANDSHAKE ERROR] Server does not support Protocol 4.1; aborting because the client requires it" << std::endl;
+        LOG_ERROR(LogCategory::HANDSHAKE) << "server does not support Protocol 4.1; aborting because the client requires it";
         return false;
     }
 
-    if (debug_) std::cerr << "[HANDSHAKE] Desired client capabilities: 0x" << std::hex << desired << std::dec << std::endl;
+    LOG_DEBUG(LogCategory::HANDSHAKE) << "desired client capabilities: 0x" << std::hex << desired << std::dec;
 
     if (server_capability & CLIENT_PLUGIN_AUTH) {
         desired |= CLIENT_PLUGIN_AUTH;
-        if (debug_) std::cerr << "[HANDSHAKE] Adding CLIENT_PLUGIN_AUTH to capabilities" << std::endl;
+        LOG_DEBUG(LogCategory::HANDSHAKE) << "adding CLIENT_PLUGIN_AUTH to capabilities";
     }
     if (server_capability & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) {
         desired |= CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA;
-        if (debug_) std::cerr << "[HANDSHAKE] Adding CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA to capabilities" << std::endl;
+        LOG_DEBUG(LogCategory::HANDSHAKE) << "adding CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA to capabilities";
     }
     if (use_tls_ && (server_capability & CLIENT_SSL)) {
         desired |= CLIENT_SSL;
-        if (debug_) std::cerr << "[HANDSHAKE] Adding CLIENT_SSL to capabilities" << std::endl;
+        LOG_DEBUG(LogCategory::HANDSHAKE) << "adding CLIENT_SSL to capabilities";
     }
 
     uint32_t capability = desired & server_capability;
     capability_flags_ = capability;
-    if (debug_) std::cerr << "[HANDSHAKE] Final negotiated capabilities: 0x" << std::hex << capability << std::dec << std::endl;
+    LOG_DEBUG(LogCategory::HANDSHAKE) << "final negotiated capabilities: 0x" << std::hex << capability << std::dec;
 
     // The initial server handshake packet is sequence 0. The next outgoing
     // packet from the client must start at sequence 1. When TLS is requested
@@ -626,15 +652,15 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
     sequence_ = 1;
 
     if ((capability & CLIENT_SSL) && use_tls_) {
-        if (debug_) std::cerr << "[HANDSHAKE] Setting up TLS connection..." << std::endl;
+        LOG_DEBUG(LogCategory::HANDSHAKE) << "setting up TLS connection...";
         if (!ensure_tls(host, capability)) {
-            std::cerr << "[HANDSHAKE ERROR] TLS setup failed" << std::endl;
+            LOG_ERROR(LogCategory::HANDSHAKE) << "TLS setup failed";
             return false;
         }
-        if (debug_) std::cerr << "[HANDSHAKE] TLS connection established" << std::endl;
+        LOG_DEBUG(LogCategory::HANDSHAKE) << "TLS connection established";
     }
 
-    if (debug_) std::cerr << "[HANDSHAKE] Building authentication response packet..." << std::endl;
+    LOG_DEBUG(LogCategory::HANDSHAKE) << "building authentication response packet...";
 
     std::vector<uint8_t> response;
     response.reserve(256);
@@ -652,45 +678,43 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
     response.insert(response.end(), user.begin(), user.end());
     response.push_back(0);
 
-    if (debug_) std::cerr << "[HANDSHAKE] Generating authentication token using '" << auth_plugin_name << "'..." << std::endl;
+    LOG_DEBUG(LogCategory::HANDSHAKE) << "generating authentication token using '" << auth_plugin_name << "'...";
 
     std::vector<uint8_t> token;
     if (auth_plugin_name == "caching_sha2_password") {
-        if (debug_) std::cerr << "[HANDSHAKE] Using caching_sha2_password scramble" << std::endl;
+        LOG_DEBUG(LogCategory::HANDSHAKE) << "using caching_sha2_password scramble";
         token = scramble_caching_sha2_password(password, scramble_buffer_);
     } else {
-        if (debug_) std::cerr << "[HANDSHAKE] Using mysql_native_password scramble" << std::endl;
+        LOG_DEBUG(LogCategory::HANDSHAKE) << "using mysql_native_password scramble";
         token = scramble_native_password(password, scramble_buffer_);
     }
 
-    if (debug_) {
-        std::cerr << "[HANDSHAKE] Generated token size: " << token.size() << " bytes" << std::endl;
-        dump_hex("[HANDSHAKE] Auth token", token.data(), token.size(), debug_);
-    }
+    LOG_DEBUG(LogCategory::HANDSHAKE) << "generated token size: " << token.size() << " bytes";
+    log_hex(LogLevel::DEBUG, LogCategory::HANDSHAKE, "auth token", token.data(), token.size());
 
     if (capability & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) {
         write_lenenc_int(response, token.size());
-        if (debug_) std::cerr << "[HANDSHAKE] Using lenenc format for auth data (length: " << token.size() << ")" << std::endl;
+        LOG_DEBUG(LogCategory::HANDSHAKE) << "using lenenc format for auth data (length: " << token.size() << ")";
     } else {
         response.push_back(static_cast<uint8_t>(token.size()));
-        if (debug_) std::cerr << "[HANDSHAKE] Using standard format for auth data (length: " << static_cast<int>(token.size()) << ")" << std::endl;
+        LOG_DEBUG(LogCategory::HANDSHAKE) << "using standard format for auth data (length: " << static_cast<int>(token.size()) << ")";
     }
     response.insert(response.end(), token.begin(), token.end());
 
     if (capability & CLIENT_PLUGIN_AUTH) {
         response.insert(response.end(), auth_plugin_name.begin(), auth_plugin_name.end());
         response.push_back(0);
-        if (debug_) std::cerr << "[HANDSHAKE] Including auth plugin name in response: " << auth_plugin_name << std::endl;
+        LOG_DEBUG(LogCategory::HANDSHAKE) << "including auth plugin name in response: " << auth_plugin_name;
     }
 
-    if (debug_) std::cerr << "[HANDSHAKE] Sending authentication response packet (" << response.size() << " bytes)..." << std::endl;
+    LOG_DEBUG(LogCategory::HANDSHAKE) << "sending authentication response packet (" << response.size() << " bytes)...";
 
     if (!write_packet(response)) {
-        std::cerr << "[HANDSHAKE ERROR] Failed to send authentication response packet" << std::endl;
+        LOG_ERROR(LogCategory::HANDSHAKE) << "failed to send authentication response packet";
         return false;
     }
 
-    if (debug_) std::cerr << "[HANDSHAKE] Waiting for authentication response from server..." << std::endl;
+    LOG_DEBUG(LogCategory::HANDSHAKE) << "waiting for authentication response from server...";
 
     auto read_auth_packet = [this](Packet &pkt) -> bool {
         if (!read_packet(pkt)) return false;
@@ -699,16 +723,16 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
     };
 
     auto fail_with_packet = [&](const Packet &auth_resp) {
-        if (debug_) std::cerr << "[HANDSHAKE] Response packet type: 0x" << std::hex
-                  << static_cast<int>(auth_resp.payload[0]) << std::dec << std::endl;
+        LOG_DEBUG(LogCategory::HANDSHAKE) << "response packet type: 0x" << std::hex
+                  << static_cast<int>(auth_resp.payload[0]) << std::dec;
         if (auth_resp.payload[0] == 0xff) {
-            std::cerr << "[HANDSHAKE ERROR] ========================================" << std::endl;
-            std::cerr << "[HANDSHAKE ERROR] AUTHENTICATION FAILED - MySQL Error Packet" << std::endl;
-            std::cerr << "[HANDSHAKE ERROR] ========================================" << std::endl;
+            LOG_ERROR(LogCategory::HANDSHAKE) << "========================================";
+            LOG_ERROR(LogCategory::HANDSHAKE) << "AUTHENTICATION FAILED - MySQL Error Packet";
+            LOG_ERROR(LogCategory::HANDSHAKE) << "========================================";
 
             if (auth_resp.payload.size() >= 3) {
                 uint16_t error_code = auth_resp.payload[1] | (auth_resp.payload[2] << 8);
-                std::cerr << "[HANDSHAKE ERROR] MySQL Error Code: " << error_code << std::endl;
+                LOG_ERROR(LogCategory::HANDSHAKE) << "MySQL Error Code: " << error_code;
 
                 // Parse error message
                 if (auth_resp.payload.size() > 3) {
@@ -716,26 +740,26 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
                     // Check for SQL state marker '#'
                     if (auth_resp.payload.size() > 9 && auth_resp.payload[3] == '#') {
                         std::string sql_state(reinterpret_cast<const char*>(&auth_resp.payload[4]), 5);
-                        std::cerr << "[HANDSHAKE ERROR] SQL State: " << sql_state << std::endl;
+                        LOG_ERROR(LogCategory::HANDSHAKE) << "SQL State: " << sql_state;
                         msg_start = 9;
                     }
 
                     if (auth_resp.payload.size() > msg_start) {
                         std::string error_message(reinterpret_cast<const char*>(&auth_resp.payload[msg_start]),
                                                  auth_resp.payload.size() - msg_start);
-                        std::cerr << "[HANDSHAKE ERROR] Error Message: " << error_message << std::endl;
+                        LOG_ERROR(LogCategory::HANDSHAKE) << "Error Message: " << error_message;
                     }
                 }
             }
 
-            std::cerr << "[HANDSHAKE ERROR] ========================================" << std::endl;
-            std::cerr << "[HANDSHAKE ERROR] Troubleshooting Information:" << std::endl;
-            std::cerr << "[HANDSHAKE ERROR]   - User: " << user << std::endl;
-            std::cerr << "[HANDSHAKE ERROR]   - Host: " << host << std::endl;
-            std::cerr << "[HANDSHAKE ERROR]   - Auth Plugin: " << auth_plugin_name << std::endl;
-            std::cerr << "[HANDSHAKE ERROR]   - Scramble Buffer Size: " << scramble_buffer_.size() << " bytes" << std::endl;
-            std::cerr << "[HANDSHAKE ERROR]   - Token Size: " << token.size() << " bytes" << std::endl;
-            std::cerr << "[HANDSHAKE ERROR] ========================================" << std::endl;
+            LOG_ERROR(LogCategory::HANDSHAKE) << "========================================";
+            LOG_ERROR(LogCategory::HANDSHAKE) << "Troubleshooting Information:";
+            LOG_ERROR(LogCategory::HANDSHAKE) << "  - User: " << user;
+            LOG_ERROR(LogCategory::HANDSHAKE) << "  - Host: " << host;
+            LOG_ERROR(LogCategory::HANDSHAKE) << "  - Auth Plugin: " << auth_plugin_name;
+            LOG_ERROR(LogCategory::HANDSHAKE) << "  - Scramble Buffer Size: " << scramble_buffer_.size() << " bytes";
+            LOG_ERROR(LogCategory::HANDSHAKE) << "  - Token Size: " << token.size() << " bytes";
+            LOG_ERROR(LogCategory::HANDSHAKE) << "========================================";
             return false;
         }
 
@@ -744,13 +768,13 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
 
     Packet auth_resp;
     if (!read_auth_packet(auth_resp)) {
-        std::cerr << "[HANDSHAKE ERROR] Failed to read authentication response packet from server" << std::endl;
+        LOG_ERROR(LogCategory::HANDSHAKE) << "failed to read authentication response packet from server";
         return false;
     }
 
     auto read_next_auth = [&](const char *context) -> bool {
         if (!read_packet(auth_resp) || auth_resp.payload.empty()) {
-            std::cerr << "[HANDSHAKE ERROR] Failed to read authentication response packet from server" << std::endl;
+            LOG_ERROR(LogCategory::HANDSHAKE) << "failed to read authentication response packet from server";
             return false;
         }
 
@@ -761,8 +785,8 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
         return true;
     };
 
-    dump_hex("[HANDSHAKE] Auth response packet", auth_resp.payload.data(), auth_resp.payload.size(), debug_);
-    if (debug_) std::cerr << "[HANDSHAKE] Response packet type: 0x" << std::hex << static_cast<int>(auth_resp.payload[0]) << std::dec << std::endl;
+    log_hex(LogLevel::DEBUG, LogCategory::HANDSHAKE, "auth response packet", auth_resp.payload.data(), auth_resp.payload.size());
+    LOG_DEBUG(LogCategory::HANDSHAKE) << "response packet type: 0x" << std::hex << static_cast<int>(auth_resp.payload[0]) << std::dec;
 
     if (!fail_with_packet(auth_resp)) return false;
 
@@ -773,22 +797,22 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
 
     auto send_additional_auth = [&](const std::vector<uint8_t> &payload) -> bool {
         if (!write_packet(payload)) {
-            std::cerr << "[HANDSHAKE ERROR] Failed to send additional authentication data" << std::endl;
+            LOG_ERROR(LogCategory::HANDSHAKE) << "failed to send additional authentication data";
             return false;
         }
         if (!read_auth_packet(auth_resp)) {
-            std::cerr << "[HANDSHAKE ERROR] Failed to read follow-up authentication response" << std::endl;
+            LOG_ERROR(LogCategory::HANDSHAKE) << "failed to read follow-up authentication response";
             return false;
         }
-        dump_hex("[HANDSHAKE] Auth response packet", auth_resp.payload.data(), auth_resp.payload.size(), debug_);
-        if (debug_) std::cerr << "[HANDSHAKE] Response packet type: 0x" << std::hex << static_cast<int>(auth_resp.payload[0]) << std::dec << std::endl;
+        log_hex(LogLevel::DEBUG, LogCategory::HANDSHAKE, "auth response packet", auth_resp.payload.data(), auth_resp.payload.size());
+        LOG_DEBUG(LogCategory::HANDSHAKE) << "response packet type: 0x" << std::hex << static_cast<int>(auth_resp.payload[0]) << std::dec;
         if (!fail_with_packet(auth_resp)) return false;
         return true;
     };
 
     // Handle authentication method negotiation.
     if (auth_resp.payload[0] == 0xfe) {
-        if (debug_) std::cerr << "[HANDSHAKE] Authentication requires additional data (AuthSwitchRequest or AuthMoreData)" << std::endl;
+        LOG_DEBUG(LogCategory::HANDSHAKE) << "authentication requires additional data (AuthSwitchRequest or AuthMoreData)";
 
         // CRITICAL: Update sequence number after receiving AuthSwitchRequest
         // The next packet we send must have sequence = server_sequence + 1
@@ -805,10 +829,8 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
             scramble_buffer_.pop_back();
         }
 
-        if (debug_) {
-            std::cerr << "[HANDSHAKE] Switched auth plugin to: " << auth_plugin_name << std::endl;
-            dump_hex("[HANDSHAKE] New scramble buffer", scramble_buffer_.data(), scramble_buffer_.size(), debug_);
-        }
+        LOG_DEBUG(LogCategory::HANDSHAKE) << "switched auth plugin to: " << auth_plugin_name;
+        log_hex(LogLevel::DEBUG, LogCategory::HANDSHAKE, "new scramble buffer", scramble_buffer_.data(), scramble_buffer_.size());
 
         if (auth_plugin_name == "mysql_native_password") {
             token = scramble_native_password(password, scramble_buffer_);
@@ -822,25 +844,25 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
     if (auth_resp.payload[0] == 0x01 && auth_plugin_name == "caching_sha2_password") {
         uint8_t status = auth_resp.payload.size() > 1 ? auth_resp.payload[1] : 0;
         if (status == 0x03) {
-            if (debug_) std::cerr << "[HANDSHAKE] caching_sha2_password fast authentication accepted" << std::endl;
+            LOG_DEBUG(LogCategory::HANDSHAKE) << "caching_sha2_password fast authentication accepted";
             if (!read_auth_packet(auth_resp)) {
-                std::cerr << "[HANDSHAKE ERROR] Failed to read OK packet after fast authentication" << std::endl;
+                LOG_ERROR(LogCategory::HANDSHAKE) << "failed to read OK packet after fast authentication";
                 return false;
             }
-            if (debug_) std::cerr << "[HANDSHAKE] Response packet type: 0x" << std::hex << static_cast<int>(auth_resp.payload[0]) << std::dec << std::endl;
+            LOG_DEBUG(LogCategory::HANDSHAKE) << "response packet type: 0x" << std::hex << static_cast<int>(auth_resp.payload[0]) << std::dec;
             if (!fail_with_packet(auth_resp)) return false;
         } else if (status == 0x04) {
-            if (debug_) std::cerr << "[HANDSHAKE] caching_sha2_password requires full authentication" << std::endl;
+            LOG_DEBUG(LogCategory::HANDSHAKE) << "caching_sha2_password requires full authentication";
 
             if (ssl_active_) {
                 std::vector<uint8_t> plain(password.begin(), password.end());
                 plain.push_back(0);
                 if (!send_additional_auth(plain)) return false;
             } else {
-                if (debug_) std::cerr << "[HANDSHAKE] Requesting RSA public key (no TLS)" << std::endl;
+                LOG_DEBUG(LogCategory::HANDSHAKE) << "requesting RSA public key (no TLS)";
                 if (!send_additional_auth({0x02})) return false; // Request public key
                 if (auth_resp.payload.empty() || auth_resp.payload[0] != 0x01) {
-                    std::cerr << "[HANDSHAKE ERROR] Server did not return RSA public key" << std::endl;
+                    LOG_ERROR(LogCategory::HANDSHAKE) << "server did not return RSA public key";
                     return false;
                 }
 
@@ -870,11 +892,12 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
     }
 
     if (auth_resp.payload[0] == 0x00) {
-        if (debug_) std::cerr << "[HANDSHAKE] Authentication successful! (OK packet received)" << std::endl;
+        LOG_INFO(LogCategory::HANDSHAKE) << "authentication successful";
         return true;
     }
 
-    std::cerr << "[HANDSHAKE ERROR] Unexpected response packet type: 0x" << std::hex << static_cast<int>(auth_resp.payload[0]) << std::dec << std::endl;
+    LOG_ERROR(LogCategory::HANDSHAKE) << "unexpected response packet type: 0x" << std::hex
+                                      << static_cast<int>(auth_resp.payload[0]) << std::dec;
     return false;
 }
 
@@ -1112,10 +1135,30 @@ bool MySQLConnection::send_query(const std::string &query, std::vector<std::vect
 }
 
 bool MySQLConnection::read_binlog_packet(BinlogPacket &packet) {
+    LOG_TRACE(LogCategory::BINLOG) << "waiting for binlog packet...";
     Packet pkt;
-    if (!read_packet(pkt)) return false;
-    if (pkt.payload.empty()) return false;
-    if (pkt.payload[0] == 0xfe && pkt.payload.size() < 9) return false; // EOF
+    if (!read_packet(pkt)) {
+        LOG_DEBUG(LogCategory::BINLOG) << "read_packet failed (timeout or disconnect)";
+        return false;
+    }
+    if (pkt.payload.empty()) {
+        LOG_WARN(LogCategory::BINLOG) << "received empty binlog packet";
+        return false;
+    }
+    if (pkt.payload[0] == 0xfe && pkt.payload.size() < 9) {
+        LOG_INFO(LogCategory::BINLOG) << "received EOF packet, stream ended";
+        return false;
+    }
+    if (pkt.payload[0] == 0xff) {
+        // Error packet
+        uint16_t error_code = 0;
+        if (pkt.payload.size() >= 3) {
+            error_code = pkt.payload[1] | (pkt.payload[2] << 8);
+        }
+        LOG_ERROR(LogCategory::BINLOG) << "received error packet from server, code=" << error_code;
+        return false;
+    }
+    LOG_TRACE(LogCategory::BINLOG) << "received binlog packet, size=" << pkt.payload.size();
     packet.event_data = std::move(pkt.payload);
     return true;
 }
@@ -1125,7 +1168,17 @@ bool MySQLConnection::recv_all(uint8_t *buf, size_t len) {
     while (received < len) {
         int n = ssl_active_ ? SSL_read(ssl_handle_, buf + received, static_cast<int>(len - received))
                             : ::recv(sock_fd_, buf + received, len - received, 0);
-        if (n <= 0) return false;
+        if (n <= 0) {
+            int err = errno;
+            if (n == 0) {
+                LOG_DEBUG(LogCategory::CONNECTION) << "recv: connection closed by peer";
+            } else if (err == EAGAIN || err == EWOULDBLOCK) {
+                LOG_DEBUG(LogCategory::CONNECTION) << "recv: timeout (EAGAIN/EWOULDBLOCK)";
+            } else {
+                LOG_DEBUG(LogCategory::CONNECTION) << "recv failed: " << strerror(err) << " (errno=" << err << ")";
+            }
+            return false;
+        }
         received += static_cast<size_t>(n);
     }
     return true;
@@ -1136,7 +1189,11 @@ bool MySQLConnection::send_all(const uint8_t *buf, size_t len) {
     while (sent < len) {
         int n = ssl_active_ ? SSL_write(ssl_handle_, buf + sent, static_cast<int>(len - sent))
                             : ::send(sock_fd_, buf + sent, len - sent, 0);
-        if (n <= 0) return false;
+        if (n <= 0) {
+            int err = errno;
+            LOG_DEBUG(LogCategory::CONNECTION) << "send failed: " << strerror(err) << " (errno=" << err << ")";
+            return false;
+        }
         sent += static_cast<size_t>(n);
     }
     return true;
@@ -1144,11 +1201,18 @@ bool MySQLConnection::send_all(const uint8_t *buf, size_t len) {
 
 bool MySQLConnection::read_packet(Packet &packet) {
     uint8_t header[4];
-    if (!recv_all(header, 4)) return false;
+    if (!recv_all(header, 4)) {
+        LOG_TRACE(LogCategory::CONNECTION) << "failed to read packet header";
+        return false;
+    }
     uint32_t length = header[0] | (header[1] << 8) | (header[2] << 16);
     packet.sequence = header[3];
+    LOG_TRACE(LogCategory::CONNECTION) << "packet header: len=" << length << " seq=" << static_cast<int>(packet.sequence);
     packet.payload.resize(length);
-    if (!recv_all(packet.payload.data(), length)) return false;
+    if (!recv_all(packet.payload.data(), length)) {
+        LOG_TRACE(LogCategory::CONNECTION) << "failed to read packet payload";
+        return false;
+    }
     return true;
 }
 

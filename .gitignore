@@ -8,7 +8,7 @@ cmake-build-*/
 *.so
 *.dylib
 *.exe
-replicapulse
+/replicapulse
 
 # Test outputs
 Testing/
