@@ -34,7 +34,9 @@ void CheckpointManager::store(const Checkpoint &cp) {
     if (cp.gtid_set) out << " " << *cp.gtid_set;
     out.flush();
     out.close();
-    std::rename(tmp.c_str(), path_.c_str());
+    if (std::rename(tmp.c_str(), path_.c_str()) != 0) {
+        std::cerr << "failed to rename checkpoint from " << tmp << " to " << path_ << std::endl;
+    }
 }
 
 } // namespace replicapulse

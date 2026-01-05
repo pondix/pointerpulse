@@ -57,6 +57,7 @@ std::string SqlFormatter::escape_value(const CellValue &value, const ColumnType 
         std::string escaped = "'";
         for (unsigned char c : value.as_string) {
             switch (c) {
+            case '\0': escaped += "\\0"; break;
             case '\\': escaped += "\\\\"; break;
             case '\'': escaped += "\\'"; break;
             case '"': escaped += "\\\""; break;

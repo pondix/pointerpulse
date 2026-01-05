@@ -369,10 +369,8 @@ CellValue decode_cell(const TableMetadata &meta, size_t idx, const uint8_t *&p) 
         int s = packed & 0x3f;
         char buf[40];
         if (fbytes > 0) {
-            uint32_t frac_scaled = fractional;
-            // Scale fractional to 6 digits based on FSP
-            for (int i = meta_val; i < 6; ++i) frac_scaled *= 10;
-            std::snprintf(buf, sizeof(buf), "%s%02d:%02d:%02d.%0*u", neg ? "-" : "", h, m, s, meta_val, frac_scaled / (meta_val < 6 ? 1 : 1));
+            // fractional is already in the correct scale for meta_val digits
+            std::snprintf(buf, sizeof(buf), "%s%02d:%02d:%02d.%0*u", neg ? "-" : "", h, m, s, static_cast<int>(meta_val), fractional);
         } else {
             std::snprintf(buf, sizeof(buf), "%s%02d:%02d:%02d", neg ? "-" : "", h, m, s);
         }
@@ -432,9 +430,8 @@ CellValue decode_cell(const TableMetadata &meta, size_t idx, const uint8_t *&p) 
         for (int i = 0; i < fbytes; ++i) fractional = (fractional << 8) | *p++;
         if (fbytes > 0) {
             char buf[32];
-            uint32_t frac_scaled = fractional;
-            for (int i = meta_val; i < 6; ++i) frac_scaled *= 10;
-            std::snprintf(buf, sizeof(buf), "%u.%0*u", v, meta_val, fractional);
+            // fractional is already in the correct scale for meta_val digits
+            std::snprintf(buf, sizeof(buf), "%u.%0*u", v, static_cast<int>(meta_val), fractional);
             cell.as_string = buf;
         } else {
             cell.as_string = std::to_string(v);
@@ -497,11 +494,10 @@ CellValue decode_cell(const TableMetadata &meta, size_t idx, const uint8_t *&p) 
         break;
     }
     default: {
-        // Fallback: assume length coded string
-        uint64_t len = read_lenenc_int(p, p + 9);
-        cell.raw.assign(p, p + len);
-        cell.as_string.assign(reinterpret_cast<const char *>(p), len);
-        p += len;
+        // Unknown column type - cannot safely determine field length without
+        // buffer bounds. Return placeholder to avoid potential buffer overread.
+        cell.present = false;
+        cell.as_string = "/* unknown type */";
         break;
     }
     }

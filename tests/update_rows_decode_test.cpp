@@ -60,7 +60,7 @@ int main() {
     meta.name = "items";
     meta.columns = {"id", "label"};
     meta.column_types = {ColumnType::LONG, ColumnType::VAR_STRING};
-    meta.metadata = {0, 255};
+    meta.metadata = {0, 256};  // 256 means 2-byte length prefix for VAR_STRING
     meta.nullable = {false, false};
     meta.primary_key = {true, false};
     meta.unique_key = {true, false};
