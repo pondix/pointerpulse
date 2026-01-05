@@ -257,9 +257,16 @@ std::string decode_decimal(const uint8_t *&p, uint16_t metadata) {
 
 CellValue decode_cell(const TableMetadata &meta, size_t idx, const uint8_t *&p) {
     CellValue cell;
-    cell.type = meta.column_types[idx];
     cell.is_null = false;
     cell.present = true;
+    // Bounds check before accessing column_types
+    if (idx >= meta.column_types.size()) {
+        cell.present = false;
+        cell.type = ColumnType::NULL_TYPE;
+        cell.as_string = "/* invalid column index */";
+        return cell;
+    }
+    cell.type = meta.column_types[idx];
     uint16_t meta_val = meta.metadata.size() > idx ? meta.metadata[idx] : 0;
     switch (cell.type) {
     case ColumnType::DECIMAL:
@@ -833,7 +840,9 @@ bool BinlogParser::parse_rows_event(const std::vector<uint8_t> &data, BinlogEven
             expanded.reserve(meta.columns.size());
             size_t included_index = 0;
             for (size_t col = 0; col < meta.columns.size(); ++col) {
-                if (mask[col]) {
+                // Check bounds before accessing mask
+                bool in_mask = (col < mask.size()) && mask[col];
+                if (in_mask) {
                     expanded.push_back(out[included_index++]);
                 } else {
                     CellValue placeholder;

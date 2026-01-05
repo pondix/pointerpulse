@@ -820,8 +820,14 @@ bool MySQLConnection::handshake(const std::string &host, const std::string &user
 
         const uint8_t *p = auth_resp.payload.data() + 1;
         const uint8_t *end = auth_resp.payload.data() + auth_resp.payload.size();
-        auth_plugin_name.assign(reinterpret_cast<const char*>(p));
-        p += auth_plugin_name.size() + 1; // consume name + null terminator
+        // Find null terminator safely within buffer bounds
+        const uint8_t *null_pos = std::find(p, end, static_cast<uint8_t>(0));
+        if (null_pos == end) {
+            LOG_ERROR(LogCategory::HANDSHAKE) << "malformed AuthSwitchRequest: missing null terminator";
+            return false;
+        }
+        auth_plugin_name.assign(reinterpret_cast<const char*>(p), null_pos - p);
+        p = null_pos + 1; // consume name + null terminator
         scramble_buffer_.assign(p, end);
 
         // Strip trailing null from scramble if present (caching_sha2_password sends 20 bytes + null)
@@ -1208,6 +1214,12 @@ bool MySQLConnection::read_packet(Packet &packet) {
     uint32_t length = header[0] | (header[1] << 8) | (header[2] << 16);
     packet.sequence = header[3];
     LOG_TRACE(LogCategory::CONNECTION) << "packet header: len=" << length << " seq=" << static_cast<int>(packet.sequence);
+    // Limit packet size to 64MB to prevent memory exhaustion from malformed headers
+    constexpr uint32_t MAX_PACKET_SIZE = 64 * 1024 * 1024;
+    if (length > MAX_PACKET_SIZE) {
+        LOG_ERROR(LogCategory::CONNECTION) << "packet size " << length << " exceeds maximum " << MAX_PACKET_SIZE;
+        return false;
+    }
     packet.payload.resize(length);
     if (!recv_all(packet.payload.data(), length)) {
         LOG_TRACE(LogCategory::CONNECTION) << "failed to read packet payload";
